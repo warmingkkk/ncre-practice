@@ -1,0 +1,30 @@
+name: Test and container smoke test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+      - run: docker build -t ncre-practice:test .
+      - name: Start container with resource limit
+        run: docker run -d --name practice --memory=512m --cpus=1 -p 127.0.0.1:8080:8080 -e ADMIN_PASSWORD=CI-Disposable-Password-2026 ncre-practice:test
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail http://127.0.0.1:8080/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs practice
+          exit 1
+      - name: Inspect container
+        if: always()
+        run: docker stats --no-stream practice && docker logs practice

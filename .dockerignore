@@ -1,0 +1,9 @@
+.git
+.deps
+.env
+data
+tests
+__pycache__
+*.xlsx
+*.docx
+*.zip
