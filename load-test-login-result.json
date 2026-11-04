@@ -1,0 +1,12 @@
+{
+  "users": 300,
+  "requests": 2400,
+  "elapsed_seconds": 19.53,
+  "requests_per_second": 122.92,
+  "p50_ms": 1697.5,
+  "p95_ms": 6956.2,
+  "errors": [],
+  "submitted": 300,
+  "real_password_login": true,
+  "environment": "Local Windows, Waitress 8 threads, SQLite WAL; includes real password hashing; excludes TLS; not a 2GB server benchmark"
+}

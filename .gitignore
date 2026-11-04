@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 .deps/
 private-*
+.upload-*

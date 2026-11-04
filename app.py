@@ -152,6 +152,7 @@ def create_app(config=None):
 
     @app.route('/')
     def home():
+        sync_user_mistakes()
         if g.user['role']=='admin':
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id')
         elif g.user['role']=='teacher':
@@ -189,6 +190,7 @@ def create_app(config=None):
 
     @app.post('/practice')
     def practice():
+        sync_user_mistakes()
         mode=request.form.get('mode','random')
         cat=request.form.get('category','')
         try: count=int(request.form.get('count',20))
@@ -241,13 +243,26 @@ def create_app(config=None):
         threshold=task['threshold'] if task else 100
         with db():
             changed=db().execute('UPDATE attempts SET answers=?,score=?,passed=?,submitted=? WHERE id=? AND submitted IS NULL',(json.dumps(answers),score,int(score*100>=len(ids)*threshold),min(time.time(),a['deadline']) if a['deadline'] else time.time(),a['id'])).rowcount
-            if changed:
-                for q in questions:
-                    correct=answers.get(str(q['id']))==q['answer']
-                    if not correct:
-                        db().execute('INSERT INTO mistakes(user_id,question_id,wrong_count,mastered) VALUES(?,?,1,0) ON CONFLICT(user_id,question_id) DO UPDATE SET wrong_count=wrong_count+1,mastered=0',(a['user_id'],q['id']))
-                    else:
-                        db().execute('UPDATE mistakes SET mastered=1 WHERE user_id=? AND question_id=?',(a['user_id'],q['id']))
+            if changed and (not task or task['kind']!='exam' or now()>=task['ends']):
+                record_mistakes(a,questions,answers)
+
+    def record_mistakes(a,questions,answers):
+        changed=db().execute('UPDATE attempts SET mistakes_synced=1 WHERE id=? AND mistakes_synced=0',(a['id'],)).rowcount
+        if not changed: return
+        for q in questions:
+            correct=answers.get(str(q['id']))==q['answer']
+            if not correct:
+                db().execute('INSERT INTO mistakes(user_id,question_id,wrong_count,mastered) VALUES(?,?,1,0) ON CONFLICT(user_id,question_id) DO UPDATE SET wrong_count=wrong_count+1,mastered=0',(a['user_id'],q['id']))
+            else:
+                db().execute('UPDATE mistakes SET mastered=1 WHERE user_id=? AND question_id=?',(a['user_id'],q['id']))
+
+    def sync_user_mistakes():
+        pending=rows('SELECT a.* FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.user_id=? AND a.submitted IS NOT NULL AND a.mistakes_synced=0 AND t.kind="exam" AND t.ends<=? ORDER BY a.submitted',(g.user['id'],now()))
+        if pending:
+            with db():
+                for a in pending:
+                    qs=[one('SELECT * FROM questions WHERE id=?',(qid,)) for qid in json.loads(a['question_ids'])]
+                    record_mistakes(a,qs,json.loads(a['answers']))
 
     @app.route('/attempts/<int:aid>',methods=['GET','POST'])
     def attempt(aid):
@@ -275,6 +290,7 @@ def create_app(config=None):
 
     @app.route('/mistakes')
     def mistakes():
+        sync_user_mistakes()
         qs=rows('SELECT q.*,m.wrong_count,m.mastered FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE user_id=? ORDER BY mastered,wrong_count DESC',(g.user['id'],))
         return render_template('mistakes.html',questions=qs)
 
@@ -398,6 +414,8 @@ def create_app(config=None):
             db().execute('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
         if 'exam_task_id' not in {r['name'] for r in rows('PRAGMA table_info(attempts)')}:
             db().execute('ALTER TABLE attempts ADD COLUMN exam_task_id INTEGER REFERENCES tasks(id)')
+        if 'mistakes_synced' not in {r['name'] for r in rows('PRAGMA table_info(attempts)')}:
+            db().execute('ALTER TABLE attempts ADD COLUMN mistakes_synced INTEGER NOT NULL DEFAULT 0')
         db().execute('CREATE UNIQUE INDEX IF NOT EXISTS one_exam_attempt ON attempts(user_id,exam_task_id)')
         db().execute('PRAGMA journal_mode=WAL')
         if not one('SELECT id FROM users WHERE role="admin"'):
@@ -420,7 +438,7 @@ CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNI
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),class_id INTEGER REFERENCES classes(id),must_change INTEGER NOT NULL DEFAULT 1,session_version INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY,category TEXT NOT NULL,stem TEXT NOT NULL,options TEXT NOT NULL,answer TEXT NOT NULL,explanation TEXT NOT NULL,UNIQUE(category,stem,options,answer,explanation));
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,class_id INTEGER NOT NULL REFERENCES classes(id),title TEXT NOT NULL,kind TEXT NOT NULL,question_ids TEXT NOT NULL,starts TEXT NOT NULL,ends TEXT NOT NULL,duration INTEGER NOT NULL,threshold INTEGER NOT NULL DEFAULT 100);
-CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),task_id INTEGER REFERENCES tasks(id),exam_task_id INTEGER REFERENCES tasks(id),question_ids TEXT NOT NULL,answers TEXT NOT NULL DEFAULT '{}',total INTEGER NOT NULL,score INTEGER,passed INTEGER DEFAULT 0,started REAL NOT NULL,deadline REAL,submitted REAL,UNIQUE(user_id,exam_task_id));
+CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),task_id INTEGER REFERENCES tasks(id),exam_task_id INTEGER REFERENCES tasks(id),question_ids TEXT NOT NULL,answers TEXT NOT NULL DEFAULT '{}',total INTEGER NOT NULL,score INTEGER,passed INTEGER DEFAULT 0,started REAL NOT NULL,deadline REAL,submitted REAL,mistakes_synced INTEGER NOT NULL DEFAULT 0,UNIQUE(user_id,exam_task_id));
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_task ON attempts(user_id,task_id) WHERE submitted IS NULL AND task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS attempt_progress ON attempts(task_id,user_id,submitted);
 CREATE TABLE IF NOT EXISTS mistakes(user_id INTEGER NOT NULL REFERENCES users(id),question_id INTEGER NOT NULL REFERENCES questions(id),wrong_count INTEGER NOT NULL,mastered INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(user_id,question_id));

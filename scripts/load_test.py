@@ -21,6 +21,7 @@ from werkzeug.security import generate_password_hash
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--users',type=int,default=300)
+parser.add_argument('--login',action='store_true',help='Include real password verification for every student')
 args=parser.parse_args()
 logging.getLogger('waitress.queue').setLevel(logging.ERROR)
 with tempfile.TemporaryDirectory() as folder:
@@ -43,7 +44,7 @@ with tempfile.TemporaryDirectory() as folder:
     timings=[]
     from urllib.parse import urlencode
     def user(uid):
-        cookie=serializer.dumps({'uid':uid,'csrf':'load-token'})
+        cookie=serializer.dumps({'csrf':'load-token'} if args.login else {'uid':uid,'csrf':'load-token'})
         conn=http.client.HTTPConnection('127.0.0.1',port,timeout=90)
         headers={'Cookie':'session='+cookie,'Content-Type':'application/x-www-form-urlencoded'}
         def call(method,path,data=None):
@@ -55,12 +56,19 @@ with tempfile.TemporaryDirectory() as folder:
             return r,elapsed
         barrier.wait(timeout=60)
         started=time.perf_counter();local=[]
-        r,t=call('POST','/tasks/1/start',{'csrf':'load-token'});local.append(t)
+        token='load-token'
+        if args.login:
+            r,t=call('POST','/login',{'csrf':token,'username':str(uid),'password':'LoadTestPassword'});local.append(t)
+            headers['Cookie']=r.getheader('Set-Cookie').split(';',1)[0]
+            r,t=call('GET','/');local.append(t)
+            headers['Cookie']=r.getheader('Set-Cookie').split(';',1)[0]
+            token=serializer.loads(headers['Cookie'].split('=',1)[1])['csrf']
+        r,t=call('POST','/tasks/1/start',{'csrf':token});local.append(t)
         path=r.getheader('Location')
         for _ in range(2):
             _,t=call('GET',path);local.append(t)
-        _,t=call('POST',path,{'csrf':'load-token','save':'1',**answers});local.append(t)
-        _,t=call('POST',path,{'csrf':'load-token',**answers});local.append(t)
+        _,t=call('POST',path,{'csrf':token,'save':'1',**answers});local.append(t)
+        _,t=call('POST',path,{'csrf':token,**answers});local.append(t)
         _,t=call('GET','/');local.append(t)
         conn.close()
         return time.perf_counter()-started,local
@@ -71,8 +79,8 @@ with tempfile.TemporaryDirectory() as folder:
             try:_,ts=f.result();timings.extend(ts)
             except Exception as e:errors.append(str(e))
     elapsed=time.perf_counter()-start
-    result=dict(users=args.users,requests=len(timings),elapsed_seconds=round(elapsed,2),requests_per_second=round(len(timings)/elapsed,2),p50_ms=round(statistics.median(timings)*1000,1) if timings else None,p95_ms=round(sorted(timings)[int(len(timings)*.95)]*1000,1) if timings else None,errors=errors,submitted=db.execute('SELECT COUNT(*) FROM attempts WHERE submitted IS NOT NULL AND score=20').fetchone()[0],environment='Local Windows, Waitress 8 threads, SQLite WAL; synthetic signed sessions; excludes password hashing and TLS; not a 2GB server benchmark')
+    result=dict(users=args.users,requests=len(timings),elapsed_seconds=round(elapsed,2),requests_per_second=round(len(timings)/elapsed,2),p50_ms=round(statistics.median(timings)*1000,1) if timings else None,p95_ms=round(sorted(timings)[int(len(timings)*.95)]*1000,1) if timings else None,errors=errors,submitted=db.execute('SELECT COUNT(*) FROM attempts WHERE submitted IS NOT NULL AND score=20').fetchone()[0],real_password_login=args.login,environment='Local Windows, Waitress 8 threads, SQLite WAL; '+('includes real password hashing; ' if args.login else 'synthetic signed sessions; excludes password hashing; ')+'excludes TLS; not a 2GB server benchmark')
     print(json.dumps(result,indent=2))
-    Path('load-test-result.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+    Path('load-test-login-result.json' if args.login else 'load-test-result.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     server.close();db.close()
     if errors or result['submitted']!=args.users:sys.exit(1)

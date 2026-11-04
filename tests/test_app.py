@@ -89,10 +89,16 @@ def test_exam_timeout_autosave_and_single_attempt(env):
     assert a['submitted'] and a['score']==1
     assert a['submitted']==a['deadline']
     assert '正确答案' not in html
+    assert db.execute('SELECT COUNT(*) FROM mistakes').fetchone()[0]==0
+    assert '正确答案' not in c.get('/mistakes').get_data(as_text=True)
     assert c.post('/tasks/2/start',data={'csrf':'token'}).location==path
     db.execute('UPDATE tasks SET ends="2001-01-01T00:00" WHERE id=2');db.commit()
     assert '正确答案' in c.get(path).get_data(as_text=True)
     assert c.get('/tasks/2/ranking').status_code==200
+    c.get('/mistakes')
+    assert db.execute('SELECT COUNT(*) FROM mistakes').fetchone()[0]==1
+    c.get('/mistakes')
+    assert db.execute('SELECT SUM(wrong_count) FROM mistakes').fetchone()[0]==1
 
 
 def test_import_two_column_and_atomic_rollback(env):
