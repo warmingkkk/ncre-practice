@@ -134,3 +134,68 @@ def test_seed_integrity():
     qs=json.loads((Path(__file__).resolve().parents[1]/'seed/questions.json').read_text(encoding='utf-8'))
     assert len(qs)==520 and len({q['category'] for q in qs})==10
     assert all(q['answer'] in 'ABCD' and len(q['options'])==4 and q['explanation'] for q in qs)
+
+
+def test_question_create_delete_restore_permissions(env):
+    app,db=env;admin=client(app,1)
+    form=dict(csrf='token',category='新增测试分类',stem='新增测试题：哪个选项正确？',A='选项一',B='选项二',C='选项三',D='选项四',answer='B',explanation='选项二正确。')
+    before=db.execute('SELECT COUNT(*) FROM questions').fetchone()[0]
+    for uid in (2,4):
+        c=client(app,uid)
+        assert c.get('/bank/new').status_code==403
+        assert c.post('/bank/new',data=form).status_code==403
+        assert c.post('/bank/1/delete',data={'csrf':'token'}).status_code==403
+        assert c.post('/bank/1/restore',data={'csrf':'token'}).status_code==403
+        assert c.get('/bank?deleted=1').status_code==403
+    invalid={**form,'answer':'E'}
+    assert admin.post('/bank/new',data=invalid).status_code==200
+    assert db.execute('SELECT COUNT(*) FROM questions').fetchone()[0]==before
+    assert admin.post('/bank/new',data=form).status_code==302
+    q=db.execute('SELECT * FROM questions WHERE category=?',(form['category'],)).fetchone()
+    assert json.loads(q['options'])==['选项一','选项二','选项三','选项四']
+    assert q['answer']=='B' and q['deleted_at'] is None
+    admin.post('/bank/new',data=form)
+    assert db.execute('SELECT COUNT(*) FROM questions').fetchone()[0]==before+1
+    assert '选项四' in admin.get('/bank?q=新增测试题').get_data(as_text=True)
+    path=client(app,4).post('/practice',data={'csrf':'token','category':form['category'],'count':1}).location
+    aid=int(path.rsplit('/',1)[1])
+    assert json.loads(db.execute('SELECT question_ids FROM attempts WHERE id=?',(aid,)).fetchone()[0])==[q['id']]
+    assert admin.post(f'/bank/{q["id"]}/delete',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM questions WHERE id=?',(q['id'],)).fetchone()[0]
+    assert form['stem'] not in admin.get('/bank?q=新增测试题').get_data(as_text=True)
+    assert form['stem'] in admin.get('/bank?deleted=1&q=新增测试题').get_data(as_text=True)
+    assert client(app,4).post('/practice',data={'csrf':'token','category':form['category'],'count':1}).location=='/bank'
+    client(app,4).post(path,data={'csrf':'token',str(q['id']):'A'})
+    assert client(app,4).post('/practice',data={'csrf':'token','mode':'wrong','count':100}).location=='/bank'
+    assert admin.post(f'/bank/{q["id"]}/restore',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM questions WHERE id=?',(q['id'],)).fetchone()[0] is None
+    assert client(app,4).post('/practice',data={'csrf':'token','mode':'wrong','count':100}).location.startswith('/attempts/')
+
+
+def test_deleted_question_preserves_tasks_and_grading(env):
+    app,db=env;admin=client(app,1);student=client(app,4)
+    q=db.execute('SELECT * FROM questions WHERE id=1').fetchone()
+    admin.post('/bank/1/delete',data={'csrf':'token'})
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    assert q['stem'] in student.get(path).get_data(as_text=True)
+    student.post(path,data={'csrf':'token','1':q['answer']})
+    assert db.execute('SELECT score FROM attempts WHERE task_id=1').fetchone()[0]==1
+    assert q['explanation'] in student.get(path).get_data(as_text=True)
+    task_form=dict(csrf='token',title='不应发布',kind='daily',starts='2000-01-01T00:00',ends='2099-01-01T00:00',duration=40,threshold=100,count=1,questions='1')
+    before=db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
+    client(app,2).post('/classes/1/tasks',data=task_form)
+    assert db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]==before
+    practice=student.post('/practice',data={'csrf':'token','category':q['category'],'count':100}).location
+    ids=json.loads(db.execute('SELECT question_ids FROM attempts WHERE id=?',(int(practice.rsplit('/',1)[1]),)).fetchone()[0])
+    assert 1 not in ids
+    assert 'name="questions" value="1"' not in client(app,2).get('/classes/1').get_data(as_text=True)
+
+
+def test_existing_database_gets_question_migration(env):
+    app,db=env
+    db.execute('DROP INDEX active_question_categories')
+    db.execute('ALTER TABLE questions DROP COLUMN deleted_at');db.commit()
+    count=db.execute('SELECT COUNT(*) FROM questions').fetchone()[0]
+    upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']})
+    assert client(upgraded,1).get('/bank').status_code==200
+    assert db.execute('SELECT COUNT(*) FROM questions WHERE deleted_at IS NULL').fetchone()[0]==count

@@ -161,15 +161,58 @@ def create_app(config=None):
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE c.id=?',(g.user['class_id'],))
         tasks=rows('SELECT t.*,c.name class_name,EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=t.id AND a.user_id=? AND a.submitted IS NOT NULL AND a.passed=1) completed FROM tasks t JOIN classes c ON c.id=t.class_id WHERE c.id IN (%s) ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))
         stats=one('SELECT COUNT(*) attempts,COALESCE(SUM(score),0) correct,COALESCE(SUM(total),0) total FROM attempts WHERE user_id=? AND submitted IS NOT NULL',(g.user['id'],))
-        wrong=one('SELECT COUNT(*) n FROM mistakes WHERE user_id=? AND mastered=0',(g.user['id'],))['n']
-        return render_template('home.html',classes=classes,tasks=tasks,stats=stats,wrong=wrong,bank_count=one('SELECT COUNT(*) n FROM questions')['n'])
+        wrong=one('SELECT COUNT(*) n FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE m.user_id=? AND m.mastered=0 AND q.deleted_at IS NULL',(g.user['id'],))['n']
+        return render_template('home.html',classes=classes,tasks=tasks,stats=stats,wrong=wrong,bank_count=one('SELECT COUNT(*) n FROM questions WHERE deleted_at IS NULL')['n'])
 
     @app.route('/bank')
     def bank():
         category=request.args.get('category','')
         search=request.args.get('q','').strip()[:100]
-        questions=rows('SELECT * FROM questions WHERE (?="" OR category=?) AND (?="" OR stem LIKE ?) ORDER BY id LIMIT 100',(category,category,search,'%'+search+'%')) if g.user['role']!='student' else []
-        return render_template('bank.html',categories=rows('SELECT category,COUNT(*) n FROM questions GROUP BY category ORDER BY MIN(id)'), questions=questions, category=category, search=search)
+        deleted=request.args.get('deleted')=='1'
+        if deleted and g.user['role']!='admin': abort(403)
+        questions=[dict(q) for q in rows('SELECT * FROM questions WHERE (deleted_at IS NOT NULL)=? AND (?="" OR category=?) AND (?="" OR stem LIKE ?) ORDER BY id LIMIT 100',(int(deleted),category,category,search,'%'+search+'%'))] if g.user['role']!='student' else []
+        for q in questions: q['options']=json.loads(q['options'])
+        return render_template('bank.html',categories=rows('SELECT category,COUNT(*) n FROM questions WHERE deleted_at IS NULL GROUP BY category ORDER BY MIN(id)'), questions=questions, category=category, search=search, deleted=deleted)
+
+    @app.route('/bank/new',methods=['GET','POST'])
+    def question_new():
+        if g.user['role']!='admin': abort(403)
+        form=request.form if request.method=='POST' else {}
+        if request.method=='POST':
+            question=dict(category=form.get('category','').strip(),stem=form.get('stem','').strip(),options=[form.get(letter,'').strip() for letter in 'ABCD'],answer=form.get('answer','').strip().upper(),explanation=form.get('explanation','').strip())
+            if not all([question['category'],question['stem'],question['explanation'],*question['options']]) or question['answer'] not in ('A','B','C','D'):
+                flash('请填写分类、题干、四个选项、正确答案和解析')
+            elif len(question['category'])>80 or len(question['stem'])>5000 or any(len(x)>2000 for x in question['options']) or len(question['explanation'])>12000:
+                flash('内容过长，请缩短后重试')
+            else:
+                with db():
+                    added=insert_question(db(),question)
+                    if added: audit('手动新增题目 '+str(added))
+                if added:
+                    flash('题目已新增，可以用于训练和发布任务')
+                    return redirect(url_for('bank',q=question['stem'][:100]))
+                flash('完全相同的题目已存在；若之前删除过，请到回收站恢复')
+        return render_template('question_new.html',form=form,categories=rows('SELECT DISTINCT category FROM questions ORDER BY category'))
+
+    @app.post('/bank/<int:qid>/delete')
+    def question_delete(qid):
+        if g.user['role']!='admin': abort(403)
+        if not one('SELECT id FROM questions WHERE id=?',(qid,)): abort(404)
+        with db():
+            changed=db().execute('UPDATE questions SET deleted_at=? WHERE id=? AND deleted_at IS NULL',(now(),qid)).rowcount
+            if changed: audit('删除题目 '+str(qid))
+        flash('题目已移入回收站，已有任务和历史记录保留原题')
+        return redirect('/bank')
+
+    @app.post('/bank/<int:qid>/restore')
+    def question_restore(qid):
+        if g.user['role']!='admin': abort(403)
+        if not one('SELECT id FROM questions WHERE id=?',(qid,)): abort(404)
+        with db():
+            changed=db().execute('UPDATE questions SET deleted_at=NULL WHERE id=? AND deleted_at IS NOT NULL',(qid,)).rowcount
+            if changed: audit('恢复题目 '+str(qid))
+        flash('题目已恢复，可以再次用于训练和发布任务')
+        return redirect(url_for('bank',deleted=1))
 
     @app.post('/bank/import')
     def bank_import():
@@ -197,9 +240,9 @@ def create_app(config=None):
         except ValueError: abort(400)
         if not 1<=count<=100: abort(400)
         if mode=='wrong':
-            pool=rows('SELECT q.id FROM questions q JOIN mistakes m ON m.question_id=q.id WHERE m.user_id=? AND m.mastered=0 ORDER BY RANDOM() LIMIT ?',(g.user['id'],count))
+            pool=rows('SELECT q.id FROM questions q JOIN mistakes m ON m.question_id=q.id WHERE m.user_id=? AND m.mastered=0 AND q.deleted_at IS NULL ORDER BY RANDOM() LIMIT ?',(g.user['id'],count))
         else:
-            pool=rows('SELECT id FROM questions WHERE (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))
+            pool=rows('SELECT id FROM questions WHERE deleted_at IS NULL AND (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))
         if not pool:
             flash('暂无可练习题目');return redirect('/bank')
         aid=new_attempt([q['id'] for q in pool])
@@ -314,7 +357,7 @@ def create_app(config=None):
     def class_detail(cid):
         c=classroom(cid);require_teacher()
         students=rows('SELECT id,username,name,must_change FROM users WHERE class_id=? AND role="student" ORDER BY username',(cid,))
-        return render_template('class.html',classroom=c,students=students,tasks=rows('SELECT * FROM tasks WHERE class_id=? ORDER BY id DESC',(cid,)),categories=rows('SELECT category,COUNT(*) n FROM questions GROUP BY category'),questions=rows('SELECT id,category,stem FROM questions ORDER BY id'))
+        return render_template('class.html',classroom=c,students=students,tasks=rows('SELECT * FROM tasks WHERE class_id=? ORDER BY id DESC',(cid,)),categories=rows('SELECT category,COUNT(*) n FROM questions WHERE deleted_at IS NULL GROUP BY category'),questions=rows('SELECT id,category,stem FROM questions WHERE deleted_at IS NULL ORDER BY id'))
 
     @app.post('/classes/<int:cid>/students')
     def students_import(cid):
@@ -368,9 +411,9 @@ def create_app(config=None):
             ids=list(dict.fromkeys(int(x) for x in request.form.getlist('questions')))
             cat=request.form.get('category','')
             if ids:
-                if len(ids)>100 or any(not one('SELECT id FROM questions WHERE id=?',(qid,)) for qid in ids): raise ValueError('题目无效')
+                if len(ids)>100 or any(not one('SELECT id FROM questions WHERE id=? AND deleted_at IS NULL',(qid,)) for qid in ids): raise ValueError('题目无效或已被删除，请刷新后重新选题')
             else:
-                ids=[r['id'] for r in rows('SELECT id FROM questions WHERE (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))]
+                ids=[r['id'] for r in rows('SELECT id FROM questions WHERE deleted_at IS NULL AND (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))]
                 if len(ids)<count: raise ValueError('该分类题量不足')
             db().execute('INSERT INTO tasks(class_id,title,kind,question_ids,starts,ends,duration,threshold) VALUES(?,?,?,?,?,?,?,?)',(cid,title,kind,json.dumps(ids),starts,ends,duration,threshold));audit('发布任务 '+title);db().commit()
             flash('发布成功，全班使用同一组题目')
@@ -410,6 +453,9 @@ def create_app(config=None):
 
     with app.app_context():
         db().executescript(SCHEMA)
+        if 'deleted_at' not in {r['name'] for r in rows('PRAGMA table_info(questions)')}:
+            db().execute('ALTER TABLE questions ADD COLUMN deleted_at TEXT')
+        db().execute('CREATE INDEX IF NOT EXISTS active_question_categories ON questions(deleted_at,category)')
         if 'session_version' not in {r['name'] for r in rows('PRAGMA table_info(users)')}:
             db().execute('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
         if 'exam_task_id' not in {r['name'] for r in rows('PRAGMA table_info(attempts)')}:
@@ -430,13 +476,14 @@ def create_app(config=None):
 
 
 def insert_question(db,q):
-    db.execute('INSERT OR IGNORE INTO questions(category,stem,options,answer,explanation) VALUES(?,?,?,?,?)',(q['category'],q['stem'],json.dumps(q['options'],ensure_ascii=False),q['answer'],q['explanation']))
+    cur=db.execute('INSERT OR IGNORE INTO questions(category,stem,options,answer,explanation) VALUES(?,?,?,?,?)',(q['category'],q['stem'],json.dumps(q['options'],ensure_ascii=False),q['answer'],q['explanation']))
+    return cur.lastrowid if cur.rowcount else None
 
 
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,teacher_id INTEGER REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),class_id INTEGER REFERENCES classes(id),must_change INTEGER NOT NULL DEFAULT 1,session_version INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY,category TEXT NOT NULL,stem TEXT NOT NULL,options TEXT NOT NULL,answer TEXT NOT NULL,explanation TEXT NOT NULL,UNIQUE(category,stem,options,answer,explanation));
+CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY,category TEXT NOT NULL,stem TEXT NOT NULL,options TEXT NOT NULL,answer TEXT NOT NULL,explanation TEXT NOT NULL,deleted_at TEXT,UNIQUE(category,stem,options,answer,explanation));
 CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,class_id INTEGER NOT NULL REFERENCES classes(id),title TEXT NOT NULL,kind TEXT NOT NULL,question_ids TEXT NOT NULL,starts TEXT NOT NULL,ends TEXT NOT NULL,duration INTEGER NOT NULL,threshold INTEGER NOT NULL DEFAULT 100);
 CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),task_id INTEGER REFERENCES tasks(id),exam_task_id INTEGER REFERENCES tasks(id),question_ids TEXT NOT NULL,answers TEXT NOT NULL DEFAULT '{}',total INTEGER NOT NULL,score INTEGER,passed INTEGER DEFAULT 0,started REAL NOT NULL,deadline REAL,submitted REAL,mistakes_synced INTEGER NOT NULL DEFAULT 0,UNIQUE(user_id,exam_task_id));
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_task ON attempts(user_id,task_id) WHERE submitted IS NULL AND task_id IS NOT NULL;

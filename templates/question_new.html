@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block content %}
+<span class="eyebrow">QUESTION MANAGEMENT</span><h1>新增题目</h1><p class="muted">填写一道单项选择题。保存后即可在题库训练和班级选题中使用。</p>
+<form class="panel stack" method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label>题目分类<input name="category" list="categories" maxlength="80" required value="{{form.get('category','')}}" placeholder="选择已有分类或输入新分类"><datalist id="categories">{% for c in categories %}<option value="{{c.category}}">{% endfor %}</datalist></label>
+<label>题干<textarea name="stem" rows="4" maxlength="5000" required>{{form.get('stem','')}}</textarea></label>
+<div class="form-grid">{% for letter in 'ABCD' %}<label>{{letter}} 选项<textarea name="{{letter}}" rows="2" maxlength="2000" required>{{form.get(letter,'')}}</textarea></label>{% endfor %}<label>正确答案<select name="answer" required><option value="">请选择</option>{% for letter in 'ABCD' %}<option {% if form.get('answer')==letter %}selected{% endif %}>{{letter}}</option>{% endfor %}</select></label></div>
+<label>答案解析<textarea name="explanation" rows="5" maxlength="12000" required>{{form.get('explanation','')}}</textarea></label>
+<div><button>保存题目</button><a class="text-link" href="/bank">返回题库</a></div></form>
+{% endblock %}
