@@ -13,6 +13,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from importers import parse_docx, parse_students
 
 ROOT = Path(__file__).resolve().parent
+STUDENT_INITIAL_PASSWORD = '123456'
 
 
 def create_app(config=None):
@@ -378,7 +379,7 @@ def create_app(config=None):
                     if old:
                         if old['class_id']!=cid or old['role']!='student': raise ValueError('学号已被其他账号使用：'+r['number'])
                         continue
-                    password=secrets.token_urlsafe(9)
+                    password=STUDENT_INITIAL_PASSWORD
                     db().execute('INSERT INTO users(username,name,password,role,class_id,must_change) VALUES(?,?,?,?,?,1)',(r['number'],r['name'],generate_password_hash(password),'student',cid))
                     credentials.append(dict(username=r['number'],name=r['name'],password=password))
                 audit(f'导入学生 {len(credentials)} 人')
@@ -394,8 +395,11 @@ def create_app(config=None):
         if g.user['role']!='admin':
             if u['role']!='student' or not u['class_id']: abort(403)
             classroom(u['class_id'])
-        password=secrets.token_urlsafe(10)
-        db().execute('UPDATE users SET password=?,must_change=1,session_version=session_version+1 WHERE id=?',(generate_password_hash(password),uid));audit('重置密码 '+u['username']);db().commit()
+        password=STUDENT_INITIAL_PASSWORD if u['role']=='student' else secrets.token_urlsafe(10)
+        with db():
+            db().execute('UPDATE users SET password=?,must_change=1,session_version=session_version+1 WHERE id=?',(generate_password_hash(password),uid))
+            db().execute('DELETE FROM login_limits WHERE username=?',(u['username'][:100],))
+            audit('重置密码 '+u['username'])
         return render_template('credentials.html',credentials=[dict(username=u['username'],name=u['name'],password=password)],back='/')
 
     @app.post('/classes/<int:cid>/tasks')

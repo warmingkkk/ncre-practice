@@ -9,7 +9,7 @@ from openpyxl import Workbook
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from app import create_app
 from importers import parse_students, parse_docx
-from werkzeug.security import generate_password_hash
+from werkzeug.security import generate_password_hash, check_password_hash
 
 
 @pytest.fixture
@@ -111,6 +111,7 @@ def test_import_two_column_and_atomic_rollback(env):
     assert r.status_code==200
     u=db.execute('SELECT * FROM users WHERE username="000001"').fetchone()
     assert u and u['must_change']==1
+    assert u['password']!='123456' and check_password_hash(u['password'],'123456')
     wb=Workbook();ws=wb.active;ws.append(['学号','姓名']);ws.append(['000002','新同学2']);ws.append(['teacher','冲突'])
     f=io.BytesIO();wb.save(f);f.seek(0)
     client(app,2).post('/classes/1/students',data={'csrf':'token','file':(f,'students.xlsx')})
@@ -199,3 +200,41 @@ def test_existing_database_gets_question_migration(env):
     upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']})
     assert client(upgraded,1).get('/bank').status_code==200
     assert db.execute('SELECT COUNT(*) FROM questions WHERE deleted_at IS NULL').fetchone()[0]==count
+
+
+def test_single_student_default_password_and_first_login(env):
+    app,db=env
+    r=client(app,2).post('/classes/1/students',data={'csrf':'token','number':'000003','name':'新增学生'})
+    assert r.status_code==200
+    u=db.execute('SELECT * FROM users WHERE username="000003"').fetchone()
+    assert check_password_hash(u['password'],'123456') and u['must_change']==1
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    c.post('/login',data={'csrf':token,'username':'000003','password':'123456'})
+    assert c.get('/').location.endswith('/password')
+    with c.session_transaction() as s:token=s['csrf']
+    c.post('/password',data={'csrf':token,'old':'123456','password':'NewStudentPassword123'})
+    u=db.execute('SELECT * FROM users WHERE username="000003"').fetchone()
+    assert not u['must_change'] and check_password_hash(u['password'],'NewStudentPassword123')
+    # Reimporting the same account must not revert a student's own password.
+    client(app,2).post('/classes/1/students',data={'csrf':'token','number':'000003','name':'新增学生'})
+    assert db.execute('SELECT password FROM users WHERE id=?',(u['id'],)).fetchone()[0]==u['password']
+
+
+@pytest.mark.parametrize('actor',[1,2])
+def test_student_password_reset_scope_and_unlock(env,actor):
+    app,db=env
+    old=client(app,4)
+    db.execute('INSERT INTO login_limits VALUES("4",8,?)',(time.time()+900,));db.commit()
+    assert client(app,3).post('/users/4/reset',data={'csrf':'token'}).status_code==403
+    assert client(app,4).post('/users/4/reset',data={'csrf':'token'}).status_code==403
+    assert client(app,2).post('/users/3/reset',data={'csrf':'token'}).status_code==403
+    assert client(app,actor).post('/users/4/reset',data={'csrf':'token'}).status_code==200
+    u=db.execute('SELECT * FROM users WHERE id=4').fetchone()
+    assert check_password_hash(u['password'],'123456') and u['must_change']==1
+    assert db.execute('SELECT * FROM login_limits WHERE username="4"').fetchone() is None
+    assert old.get('/').location.endswith('/login')
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data={'csrf':token,'username':'4','password':'123456'}).status_code==302
+    assert c.get('/').location.endswith('/password')
