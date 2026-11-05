@@ -7,7 +7,6 @@ services:
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在.env中设置管理员初始密码}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
-      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-ncre_practice_session}
     volumes:
       - practice-data:/app/data
     mem_limit: 512m

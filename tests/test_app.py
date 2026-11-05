@@ -524,33 +524,6 @@ def test_admin_recovery_cli_environment_password_is_not_printed(env,tmp_path,mon
     assert info['matches_environment_password'] and not info['locked']
 
 
-def test_login_cookie_is_isolated_from_legacy_session_cookie(env):
-    app,db=env
-    assert app.config['SESSION_COOKIE_NAME']=='ncre_practice_session'
-    c=app.test_client()
-    c.set_cookie('session','unrelated-old-session')
-    c.get('/login')
-    with c.session_transaction() as s:token=s['csrf']
-    r=c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True)
-    assert r.request.path=='/' and c.get('/admin').status_code==200
-    assert c.get_cookie('ncre_practice_session') is not None
-    assert c.get_cookie('session').value=='unrelated-old-session'
-    with c.session_transaction() as s:token=s['csrf']
-    c.post('/logout',data={'csrf':token})
-    assert c.get('/admin').location=='/login'
-    assert c.get_cookie('session').value=='unrelated-old-session'
-
-
-def test_old_cookie_alone_does_not_authenticate_after_cookie_rename(env):
-    app,db=env
-    legacy=app.session_interface.get_signing_serializer(app).dumps({'uid':1,'version':0,'csrf':'legacy-token'})
-    c=app.test_client();c.set_cookie('session',legacy)
-    assert c.get('/admin').location=='/login'
-    c.get('/login')
-    with c.session_transaction() as s:token=s['csrf']
-    assert c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True).request.path=='/'
-
-
 def test_exam_edit_locks_timing_and_questions_after_start(env):
     app,db=env;teacher=client(app,2)
     data=dict(csrf='token',title='新版模拟考',starts='2000-01-01T00:00',ends='2099-01-01T00:00',duration=20,threshold=50,selection='manual',questions=['3','4'])
@@ -622,41 +595,3 @@ def test_class_soft_delete_migration_and_shared_teacher_protection(env):
     db.execute('INSERT INTO classes(name,teacher_id) VALUES("同一班主任的另一个班",2)');db.commit()
     assert client(upgraded,1).post('/classes/1/delete',data={'csrf':'token'}).status_code==400
     assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0] is None
-
-
-def test_stale_login_form_recovers_without_authenticating_or_counting_failure(env):
-    app,db=env;c=app.test_client()
-    c.get('/login')
-    with c.session_transaction() as s:old_token=s['csrf']
-    c.delete_cookie(app.config['SESSION_COOKIE_NAME'])
-    r=c.post('/login',data=dict(csrf=old_token,username='admin',password='TestPassword123'))
-    html=r.get_data(as_text=True)
-    assert r.status_code==200 and '登录页面已更新' in html
-    assert 'value="admin"' in html and 'TestPassword123' not in html
-    with c.session_transaction() as s:
-        assert 'uid' not in s
-        token=s['csrf'];assert token!=old_token
-    assert db.execute('SELECT COUNT(*) FROM login_limits').fetchone()[0]==0
-    assert c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True).request.path=='/'
-
-
-def test_wrong_login_csrf_does_not_bypass_protection(env):
-    app,db=env;c=app.test_client();c.get('/login')
-    r=c.post('/login',data=dict(csrf='forged',username='admin',password='TestPassword123'))
-    assert r.status_code==200 and '登录页面已更新' in r.get_data(as_text=True)
-    with c.session_transaction() as s:assert 'uid' not in s
-    assert c.get('/admin').location=='/login'
-    assert client(app,1).post('/classes/1/delete',data={'csrf':'forged'}).status_code==400
-    assert db.execute('SELECT deleted_at FROM classes WHERE id=1').fetchone()[0] is None
-
-
-def test_assets_and_health_never_write_session_cookie(env):
-    app,db=env
-    authenticated=client(app,1)
-    with authenticated.session_transaction() as s:s.permanent=True
-    for c in (app.test_client(),authenticated):
-        for url in ('/health','/static/app.css','/static/app.js','/static/missing.css'):
-            r=c.get(url)
-            assert not r.headers.getlist('Set-Cookie'),url
-    c=app.test_client();r=c.get('/login')
-    assert r.headers.getlist('Set-Cookie')

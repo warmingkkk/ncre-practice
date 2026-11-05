@@ -27,7 +27,7 @@ def create_app(config=None):
                 f.write(secrets.token_hex(32))
         except FileExistsError:
             pass
-    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_NAME=os.environ.get('SESSION_COOKIE_NAME','ncre_practice_session'), SESSION_COOKIE_HTTPONLY=True, SESSION_REFRESH_EACH_REQUEST=False, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
+    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
     if config:
         app.config.update(config)
 
@@ -124,24 +124,11 @@ def create_app(config=None):
 
     @app.before_request
     def guard():
-        g.user=None
-        # Assets and health checks must never create or refresh a login session.
-        if request.endpoint in ('static','health'):
-            return
         g.user = one('SELECT * FROM users WHERE id=?',(session.get('uid'),)) if session.get('uid') else None
         if g.user and (g.user['deleted_at'] or session.get('version',0)!=g.user['session_version']):
             session.clear();g.user=None
         session.setdefault('csrf', secrets.token_hex(24))
         if request.method == 'POST' and not secrets.compare_digest(str(request.form.get('csrf') or request.headers.get('X-CSRF-Token','')), session['csrf']):
-            if request.endpoint=='login':
-                # Reject the stale POST, but give the user a fresh form immediately.
-                # Never validate credentials or replay a rejected login automatically.
-                app.logger.warning('Login CSRF rejected: cookie_present=%s duplicate_cookie=%s token_present=%s',
-                    bool(request.cookies.get(app.config['SESSION_COOKIE_NAME'])),
-                    len(request.cookies.getlist(app.config['SESSION_COOKIE_NAME']))>1,
-                    bool(request.form.get('csrf')))
-                flash('登录页面已更新，请重新输入密码登录。如果仍反复出现此提示，请清除本站 Cookie，并关闭其他旧登录页面后重试。')
-                return render_template('login.html',username=request.form.get('username','')[:100]),200
             abort(400, '页面已过期，请刷新后重试')
         if request.endpoint not in ('login','static','health'):
             if not g.user:
@@ -160,7 +147,7 @@ def create_app(config=None):
 
     @app.context_processor
     def context():
-        return dict(current=g.user, csrf=session.get('csrf',''), today=now()[:10], roles={'admin':'管理员','teacher':'班主任','student':'学生'})
+        return dict(current=g.user, csrf=session['csrf'], today=now()[:10], roles={'admin':'管理员','teacher':'班主任','student':'学生'})
 
     @app.errorhandler(400)
     @app.errorhandler(403)
