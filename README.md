@@ -42,6 +42,8 @@ docker compose logs --tail 100 web
 
 ### 管理员无法登录时的恢复
 
+如果密码验证后又跳回 `/login`，先用无痕窗口登录。若无痕正常，清除普通浏览器中**仅本站的 Cookie / 网站数据**后重试，无需继续重置密码。本应用使用独立的 `ncre_practice_session` Cookie，避免读取旧的通用 `session` Cookie；升级到此版本后所有用户需重新登录一次。若同一域名部署多套本应用，可在各自 `.env` 中设置不同的 `SESSION_COOKIE_NAME`。
+
 更新不会把管理员密码改回 `.env`。如果新密码和初始密码都不可用，请在服务器的项目目录运行只读检查：
 
 ```bash

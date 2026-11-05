@@ -27,7 +27,7 @@ def create_app(config=None):
                 f.write(secrets.token_hex(32))
         except FileExistsError:
             pass
-    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
+    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_NAME=os.environ.get('SESSION_COOKIE_NAME','ncre_practice_session'), SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
     if config:
         app.config.update(config)
 

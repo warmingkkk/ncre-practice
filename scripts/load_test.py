@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory() as folder:
     def user(uid):
         cookie=serializer.dumps({'csrf':'load-token'} if args.login else {'uid':uid,'csrf':'load-token'})
         conn=http.client.HTTPConnection('127.0.0.1',port,timeout=90)
-        headers={'Cookie':'session='+cookie,'Content-Type':'application/x-www-form-urlencoded'}
+        headers={'Cookie':app.config['SESSION_COOKIE_NAME']+'='+cookie,'Content-Type':'application/x-www-form-urlencoded'}
         def call(method,path,data=None):
             started=time.perf_counter()
             conn.request(method,path,urlencode(data) if data else None,headers)
