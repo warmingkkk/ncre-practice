@@ -14,6 +14,10 @@ jobs:
           python-version: '3.13'
       - run: pip install -r requirements.txt pytest
       - run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/session_form.test.cjs
       - run: docker build -t ncre-practice:test .
       - name: Start container with resource limit
         run: docker run -d --name practice --memory=512m --cpus=1 -p 127.0.0.1:8080:8080 -e ADMIN_PASSWORD=CI-Disposable-Password-2026 ncre-practice:test

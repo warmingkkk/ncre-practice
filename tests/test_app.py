@@ -595,3 +595,61 @@ def test_class_soft_delete_migration_and_shared_teacher_protection(env):
     db.execute('INSERT INTO classes(name,teacher_id) VALUES("同一班主任的另一个班",2)');db.commit()
     assert client(upgraded,1).post('/classes/1/delete',data={'csrf':'token'}).status_code==400
     assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0] is None
+
+
+def test_browser_session_roundtrip_and_first_class_submission(env):
+    app,db=env;c=app.test_client()
+    login=c.get('/login')
+    token=re.search(r'name="csrf" value="([^"]+)"',login.get_data(as_text=True)).group(1)
+    # Asset requests must not overwrite either a new or a permanent login cookie.
+    for path in ('/static/app.js','/static/app.css','/health'):
+        assert not c.get(path).headers.getlist('Set-Cookie')
+    state=c.get('/session-state').json
+    assert state['cookie_ok'] and state['csrf']==token and state['uid'] is None
+    assert c.post('/login',data=dict(csrf=state['csrf'],username='admin',password='TestPassword123')).location=='/'
+    for path in ('/static/app.js','/static/app.css','/health'):
+        assert not c.get(path).headers.getlist('Set-Cookie')
+    assert c.get('/classes/new').status_code==200
+    state=c.get('/session-state').json
+    assert state['uid']==1 and state['cookie_ok']
+    data=dict(csrf=state['csrf'],name='首次创建班级',username='first-submit',teacher='首次教师')
+    r=c.post('/classes',data=data)
+    assert r.status_code==200 and '班级与班主任账号创建成功' in r.get_data(as_text=True)
+    assert db.execute('SELECT COUNT(*) FROM classes WHERE name=?',(data['name'],)).fetchone()[0]==1
+    assert c.post('/classes',data=data).status_code==409
+    assert db.execute('SELECT COUNT(*) FROM users WHERE username=?',(data['username'],)).fetchone()[0]==1
+
+
+def test_class_validation_keeps_form_and_does_not_create_partial_accounts(env):
+    app,db=env;c=client(app,1)
+    data=dict(csrf='token',name='保留班名',username='retry-teacher',teacher='保留教师',initial_password='123456')
+    r=c.post('/classes',data=data);html=r.get_data(as_text=True)
+    assert r.status_code==400 and '保留班名' in html and '10至128位' in html
+    assert 'value="123456"' not in html
+    assert db.execute('SELECT id FROM users WHERE username="retry-teacher"').fetchone() is None
+    data['initial_password']='ValidTeacherPassword123'
+    assert c.post('/classes',data=data).status_code==200
+    assert client(app,2).get('/classes/new').status_code==403
+
+
+def test_missing_cookie_and_stale_csrf_never_authenticate(env):
+    app,db=env;c=app.test_client()
+    c.get('/login')
+    with c.session_transaction() as s:old=s['csrf']
+    c.delete_cookie(app.config['SESSION_COOKIE_NAME'])
+    r=c.post('/login',data=dict(csrf=old,username='admin',password='TestPassword123'))
+    assert r.status_code==200 and '登录状态未能验证' in r.get_data(as_text=True)
+    with c.session_transaction() as s:assert 'uid' not in s
+    assert app.test_client().get('/session-state').json['cookie_ok'] is False
+    assert client(app,1).post('/classes',data=dict(csrf='invalid',name='不应创建',username='invalid')).status_code==400
+    assert db.execute('SELECT id FROM classes WHERE name="不应创建"').fetchone() is None
+
+
+def test_secure_cookie_roundtrip_over_https(env):
+    app,db=env;app.config['SESSION_COOKIE_SECURE']=True
+    c=app.test_client();r=c.get('/login',base_url='https://practice.test')
+    assert '; Secure;' in r.headers['Set-Cookie']
+    state=c.get('/session-state',base_url='https://practice.test').json
+    assert state['cookie_ok'] and state['secure']
+    assert c.post('/login',base_url='https://practice.test',data=dict(csrf=state['csrf'],username='admin',password='TestPassword123')).status_code==302
+    assert c.get('/admin',base_url='https://practice.test').status_code==200

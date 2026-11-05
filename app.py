@@ -27,7 +27,7 @@ def create_app(config=None):
                 f.write(secrets.token_hex(32))
         except FileExistsError:
             pass
-    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
+    app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or secret_file.read_text(), DATABASE=str(data/'practice.db'), MAX_CONTENT_LENGTH=8*1024*1024, SESSION_REFRESH_EACH_REQUEST=False, SESSION_COOKIE_PATH="/", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
     if config:
         app.config.update(config)
 
@@ -124,13 +124,19 @@ def create_app(config=None):
 
     @app.before_request
     def guard():
+        g.user=None
+        if request.endpoint in ('static','health'):
+            return
         g.user = one('SELECT * FROM users WHERE id=?',(session.get('uid'),)) if session.get('uid') else None
         if g.user and (g.user['deleted_at'] or session.get('version',0)!=g.user['session_version']):
             session.clear();g.user=None
         session.setdefault('csrf', secrets.token_hex(24))
         if request.method == 'POST' and not secrets.compare_digest(str(request.form.get('csrf') or request.headers.get('X-CSRF-Token','')), session['csrf']):
+            if request.endpoint=='login':
+                flash('登录状态未能验证，请重新输入密码。若反复出现，请确认正在使用 HTTPS 并允许本站 Cookie。')
+                return render_template('login.html',username=request.form.get('username','')[:100]),200
             abort(400, '页面已过期，请刷新后重试')
-        if request.endpoint not in ('login','static','health'):
+        if request.endpoint not in ('login','static','health','session_state'):
             if not g.user:
                 return redirect(url_for('login'))
             if g.user['must_change'] and request.endpoint not in ('password','logout'):
@@ -147,7 +153,7 @@ def create_app(config=None):
 
     @app.context_processor
     def context():
-        return dict(current=g.user, csrf=session['csrf'], today=now()[:10], roles={'admin':'管理员','teacher':'班主任','student':'学生'})
+        return dict(current=g.user, csrf=session.get('csrf',''), today=now()[:10], roles={'admin':'管理员','teacher':'班主任','student':'学生'})
 
     @app.errorhandler(400)
     @app.errorhandler(403)
@@ -160,6 +166,12 @@ def create_app(config=None):
     def health():
         one('SELECT 1')
         return {'status':'ok'}
+
+    @app.get('/session-state')
+    def session_state():
+        return jsonify(csrf=session['csrf'],uid=g.user['id'] if g.user else None,
+            cookie_ok=bool(request.cookies.get(app.config['SESSION_COOKIE_NAME'])),
+            secure=app.config['SESSION_COOKIE_SECURE'])
 
     @app.route('/login',methods=['GET','POST'])
     def login():
@@ -396,26 +408,32 @@ def create_app(config=None):
         qs=rows('SELECT q.*,m.wrong_count,m.mastered FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE user_id=? ORDER BY mastered,wrong_count DESC',(g.user['id'],))
         return render_template('mistakes.html',questions=qs)
 
+    @app.get('/classes/new')
+    def class_new():
+        if g.user['role']!='admin': abort(403)
+        return render_template('class_new.html',form={})
+
     @app.post('/classes')
     def create_class():
         if g.user['role']!='admin': abort(403)
         name=request.form.get('name','').strip()[:100]
         username=request.form.get('username','').strip()[:100]
-        if not name or not username: abort(400)
+        if not name or not username:
+            return render_template('class_new.html',form=request.form,error='班级名称和班主任账号不能为空'),400
         password=request.form.get('initial_password','').strip()
         if password and not 10<=len(password)<=128:
-            flash('班主任初始密码需为10至128位；也可以留空自动生成')
-            return redirect('/')
+            return render_template('class_new.html',form=request.form,error='班主任初始密码需为10至128位；也可以留空自动生成'),400
         password=password or secrets.token_urlsafe(10)
         try:
             with db():
+                db().execute('BEGIN IMMEDIATE')
                 uid=db().execute('INSERT INTO users(username,name,password,role,must_change) VALUES(?,?,?,?,1)',(username,request.form.get('teacher','班主任').strip()[:80] or '班主任',generate_password_hash(password),'teacher')).lastrowid
                 cid=db().execute('INSERT INTO classes(name,teacher_id) VALUES(?,?)',(name,uid)).lastrowid
                 db().execute('DELETE FROM login_limits WHERE username=?',(username,))
                 audit('新建班级 '+name)
         except sqlite3.IntegrityError:
-            flash('班级名称或班主任账号重复');return redirect('/')
-        return render_template('credentials.html',credentials=[dict(username=username,name=name+'班主任',password=password)],back=url_for('class_detail',cid=cid))
+            return render_template('class_new.html',form=request.form,error='班级名称或班主任账号重复，请修改后提交（已删除的记录也保留名称和账号）'),409
+        return render_template('credentials.html',success='班级与班主任账号创建成功',credentials=[dict(username=username,name=name+'班主任',password=password)],back=url_for('class_detail',cid=cid))
 
     @app.route('/classes/<int:cid>/edit',methods=['GET','POST'])
     def class_edit(cid):

@@ -20,3 +20,28 @@ if(form?.dataset.active==='1'){
 }
 const table=document.querySelector('[data-poll]');
 if(table){setInterval(async()=>{try{const response=await fetch(table.dataset.poll);if(!response.ok)throw Error();const data=await response.json();const body=document.createElement('tbody');for(const r of data){const row=body.insertRow();for(const value of [r.username,r.name,r.attempts,r.best??'—',r.status??'未作答'])row.insertCell().textContent=value;}table.tBodies[0].replaceWith(body);document.getElementById('poll-status').textContent='已更新 · '+new Date().toLocaleTimeString();}catch{document.getElementById('poll-status').textContent='更新失败，10秒后重试';}},10000);}
+
+// Verify the current browser session before sending credentials or creating a class.
+document.querySelectorAll('[data-session-form]').forEach(f=>{
+ let busy=false;
+ const message=f.querySelector('[data-session-message]');
+ f.addEventListener('submit',async e=>{
+  e.preventDefault();if(busy)return;busy=true;
+  const button=f.querySelector('button[type="submit"],button:not([type])');
+  const label=button.textContent;button.disabled=true;button.textContent='正在提交…';
+  try{
+   message.textContent='正在确认登录状态…';
+   const r=await fetch('/session-state',{credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json'},signal:AbortSignal.timeout(10000)});
+   if(!r.ok)throw Error('暂时无法确认登录状态，请稍后重试。');
+   const state=await r.json();
+   if(!state.cookie_ok&&state.secure&&location.protocol==='http:'){const target=new URL(location.href);target.protocol='https:';if(target.port==='80')target.port='';location.replace(target.href);return;}
+   if(!state.cookie_ok)throw Error('浏览器没有传回本站 Cookie。请通过 HTTPS 打开网站并允许本站 Cookie，再重新登录。');
+   if(String(state.uid??'')!==f.dataset.uid)throw Error('登录账号已改变或会话已失效，请刷新页面后重试。');
+   f.elements.csrf.value=state.csrf;
+   message.textContent='正在提交，请稍候…';
+   HTMLFormElement.prototype.submit.call(f);
+  }catch(error){message.textContent=error.message||'请求失败，请检查网络后重试。';button.disabled=false;button.textContent=label;busy=false;}
+ });
+ window.addEventListener('pageshow',()=>{busy=false;buttonReset();});
+ function buttonReset(){const b=f.querySelector('button');if(b){b.disabled=false;if(b.textContent==='正在提交…')b.textContent=f.dataset.uid?'创建班级和班主任账号':'登录练习室 →';}}
+});
