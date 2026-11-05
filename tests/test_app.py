@@ -622,3 +622,41 @@ def test_class_soft_delete_migration_and_shared_teacher_protection(env):
     db.execute('INSERT INTO classes(name,teacher_id) VALUES("同一班主任的另一个班",2)');db.commit()
     assert client(upgraded,1).post('/classes/1/delete',data={'csrf':'token'}).status_code==400
     assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0] is None
+
+
+def test_stale_login_form_recovers_without_authenticating_or_counting_failure(env):
+    app,db=env;c=app.test_client()
+    c.get('/login')
+    with c.session_transaction() as s:old_token=s['csrf']
+    c.delete_cookie(app.config['SESSION_COOKIE_NAME'])
+    r=c.post('/login',data=dict(csrf=old_token,username='admin',password='TestPassword123'))
+    html=r.get_data(as_text=True)
+    assert r.status_code==200 and '登录页面已更新' in html
+    assert 'value="admin"' in html and 'TestPassword123' not in html
+    with c.session_transaction() as s:
+        assert 'uid' not in s
+        token=s['csrf'];assert token!=old_token
+    assert db.execute('SELECT COUNT(*) FROM login_limits').fetchone()[0]==0
+    assert c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True).request.path=='/'
+
+
+def test_wrong_login_csrf_does_not_bypass_protection(env):
+    app,db=env;c=app.test_client();c.get('/login')
+    r=c.post('/login',data=dict(csrf='forged',username='admin',password='TestPassword123'))
+    assert r.status_code==200 and '登录页面已更新' in r.get_data(as_text=True)
+    with c.session_transaction() as s:assert 'uid' not in s
+    assert c.get('/admin').location=='/login'
+    assert client(app,1).post('/classes/1/delete',data={'csrf':'forged'}).status_code==400
+    assert db.execute('SELECT deleted_at FROM classes WHERE id=1').fetchone()[0] is None
+
+
+def test_assets_and_health_never_write_session_cookie(env):
+    app,db=env
+    authenticated=client(app,1)
+    with authenticated.session_transaction() as s:s.permanent=True
+    for c in (app.test_client(),authenticated):
+        for url in ('/health','/static/app.css','/static/app.js','/static/missing.css'):
+            r=c.get(url)
+            assert not r.headers.getlist('Set-Cookie'),url
+    c=app.test_client();r=c.get('/login')
+    assert r.headers.getlist('Set-Cookie')
