@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block content %}
+<span class="eyebrow">STUDENT MANAGEMENT</span><h1>修改学生信息</h1><p class="muted">修改姓名、学号或所属班级。原有答卷与成绩会随该学生保留；学号或班级变更后需重新登录。</p>
+<form class="panel stack narrow" method="post"><input type="hidden" name="csrf" value="{{csrf}}">
+<label>姓名<input name="name" maxlength="80" required value="{{form.get('name',student.name)}}"></label>
+<label>学号 / 登录账号<input name="number" maxlength="100" required value="{{form.get('number',student.username)}}"></label>
+<label>所属班级<select name="class_id" required>{% for c in classes %}<option value="{{c.id}}" {% if c.id|string==form.get('class_id',student.class_id|string) %}selected{% endif %}>{{c.name}}</option>{% endfor %}</select></label>
+<div><button>保存学生信息</button><a class="text-link" href="/classes/{{student.class_id}}">返回班级</a></div></form>
+{% endblock %}

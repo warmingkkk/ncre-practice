@@ -2,6 +2,8 @@ document.querySelectorAll('[data-confirm]').forEach(f=>f.addEventListener('submi
 document.getElementById('print')?.addEventListener('click',()=>window.print());
 const category=document.getElementById('publish-category');
 category?.addEventListener('change',()=>document.querySelectorAll('[data-category]').forEach(el=>el.hidden=!!category.value&&el.dataset.category!==category.value));
+const editSelection=document.getElementById('edit-selection');
+if(editSelection){document.querySelectorAll('#task-edit-form input[name="questions"]').forEach(input=>input.addEventListener('change',()=>{editSelection.value='manual'}));document.getElementById('edit-count')?.addEventListener('input',()=>{editSelection.value='random'});}
 const form=document.getElementById('answer-form');
 if(form?.dataset.active==='1'){
  let pending=Promise.resolve(),submitted=false,saveTimer;

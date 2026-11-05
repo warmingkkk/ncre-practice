@@ -1,0 +1,16 @@
+{% extends 'base.html' %}
+{% block content %}
+<span class="eyebrow">DAILY PRACTICE</span><h1>修改每日练习</h1>
+{% if locked %}<p class="notice">已有学生开始作答，题目与达标率已锁定。可修改名称和开放时间；更换题目请重新发布练习。</p>{% else %}<p class="muted">当前尚无人开始作答，可修改名称、开放时间、题目和达标率。</p>{% endif %}
+<form id="task-edit-form" class="panel stack" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><div class="form-grid">
+<label>练习名称<input name="title" maxlength="100" required value="{{form.get('title',task.title)}}"></label>
+<label>开放时间<input name="starts" type="datetime-local" required value="{{form.get('starts',task.starts)}}"></label>
+<label>结束时间<input name="ends" type="datetime-local" required value="{{form.get('ends',task.ends)}}"></label>
+{% if not locked %}<label>达标正确率（%）<input name="threshold" type="number" min="1" max="100" required value="{{form.get('threshold',task.threshold)}}"></label>
+<label>组题方式<select name="selection" id="edit-selection">{% for value,label in [('keep','保留当前题目'),('manual','手动重新选题'),('random','重新随机组题')] %}<option value="{{value}}" {% if form.get('selection','keep')==value %}selected{% endif %}>{{label}}</option>{% endfor %}</select></label>
+<label>随机组题分类<select name="category" id="publish-category"><option value="">全部分类</option>{% for c in categories %}<option {% if form.get('category')==c.category %}selected{% endif %}>{{c.category}}</option>{% endfor %}</select></label>
+<label>随机题数<input id="edit-count" name="count" type="number" min="1" max="100" value="{{form.get('count',selected|length)}}"></label>{% endif %}</div>
+<p class="muted">当前共 {{current_count}} 题 · 达标要求 {{task.threshold}}%。保存名称或时间不会清空已有完成状态。</p>
+{% if not locked %}<details><summary>手动重新选题</summary><p class="muted">勾选题目后自动切换为手动选题，最多100题。</p><div class="question-picker">{% for q in questions %}<label data-category="{{q.category}}"><input type="checkbox" name="questions" value="{{q.id}}" {% if q.id in selected %}checked{% endif %}> #{{q.id}} · {{q.category}} · {{q.stem}}</label>{% endfor %}</div></details>{% endif %}
+<div><button>保存每日练习</button><a class="text-link" href="/classes/{{task.class_id}}">返回班级</a></div></form>
+{% endblock %}

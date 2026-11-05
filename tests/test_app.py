@@ -4,6 +4,8 @@ import re
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 import pytest
 from openpyxl import Workbook
@@ -320,3 +322,133 @@ def test_admin_can_choose_and_reset_teacher_initial_password(env):
     c.get('/login')
     with c.session_transaction() as s:token=s['csrf']
     assert c.post('/login',data=dict(csrf=token,username='chosen-teacher',password=reset),follow_redirects=True).request.path=='/password'
+
+
+def test_student_edit_preserves_records_and_enforces_class_scope(env):
+    app,db=env;student=client(app,4)
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    password=db.execute('SELECT password FROM users WHERE id=4').fetchone()[0]
+    assert client(app,3).get('/students/4/edit').status_code==403
+    assert client(app,4).get('/students/4/edit').status_code==403
+    assert client(app,2).get('/students/4/edit').status_code==200
+    teacher=client(app,2)
+    teacher.post('/students/4/edit',data=dict(csrf='token',name='修改后姓名',number='5',class_id=1))
+    assert db.execute('SELECT username FROM users WHERE id=4').fetchone()[0]=='4'
+    assert teacher.post('/students/4/edit',data=dict(csrf='token',name='修改后姓名',number='000004',class_id=1)).status_code==302
+    u=db.execute('SELECT * FROM users WHERE id=4').fetchone()
+    assert u['name']=='修改后姓名' and u['username']=='000004' and u['password']==password
+    assert db.execute('SELECT user_id FROM attempts WHERE id=?',(int(path.rsplit('/',1)[1]),)).fetchone()[0]==4
+    assert student.get('/').location=='/login'
+    db.execute('INSERT INTO classes(id,name,teacher_id) VALUES(2,"另一个班",3)');db.commit()
+    assert teacher.post('/students/4/edit',data=dict(csrf='token',name=u['name'],number=u['username'],class_id=2)).status_code==403
+    assert db.execute('SELECT class_id FROM users WHERE id=4').fetchone()[0]==1
+    assert client(app,1).post('/students/4/edit',data=dict(csrf='token',name=u['name'],number=u['username'],class_id=2)).status_code==302
+    assert db.execute('SELECT class_id FROM users WHERE id=4').fetchone()[0]==2
+    assert teacher.get('/students/4/edit').status_code==403
+    assert client(app,3).get('/students/4/edit').status_code==200
+
+
+def test_student_delete_restore_disables_login_and_preserves_history(env):
+    app,db=env;teacher=client(app,2);student=client(app,4)
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    assert client(app,3).post('/students/4/delete',data={'csrf':'token'}).status_code==403
+    assert client(app,4).post('/students/5/delete',data={'csrf':'token'}).status_code==403
+    assert teacher.post('/students/4/delete',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM users WHERE id=4').fetchone()[0]
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE user_id=4').fetchone()[0]==1
+    assert student.get('/').location=='/login'
+    assert all(r['id']!=4 for r in teacher.get('/tasks/1/progress?format=json').json)
+    assert '/students/4/edit' not in teacher.get('/classes/1').get_data(as_text=True)
+    assert '/students/4/restore' in teacher.get('/classes/1?students=deleted').get_data(as_text=True)
+    assert teacher.post('/users/4/reset',data={'csrf':'token'}).status_code==404
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    r=c.post('/login',data=dict(csrf=token,username='4',password='TestPassword123'))
+    assert '账号或密码不正确' in r.get_data(as_text=True)
+    db.execute('INSERT OR REPLACE INTO login_limits VALUES("4",8,?)',(time.time()+900,));db.commit()
+    assert teacher.post('/students/4/restore',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM users WHERE id=4').fetchone()[0] is None
+    assert db.execute('SELECT * FROM login_limits WHERE username="4"').fetchone() is None
+    c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data=dict(csrf=token,username='4',password='TestPassword123'),follow_redirects=True).request.path=='/'
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE user_id=4').fetchone()[0]==1
+
+
+def test_daily_task_edit_before_and_after_start(env):
+    app,db=env;teacher=client(app,2)
+    data=dict(csrf='token',title='修改后的每日练习',starts='2000-01-01T00:00',ends='2099-01-01T00:00',threshold=50,selection='manual',questions=['3','4'])
+    assert teacher.get('/tasks/1/edit').status_code==200
+    assert client(app,3).get('/tasks/1/edit').status_code==403
+    assert client(app,4).post('/tasks/1/edit',data=data).status_code==403
+    assert teacher.get('/tasks/2/edit').status_code==400
+    assert teacher.post('/tasks/1/edit',data=data).status_code==302
+    task=db.execute('SELECT * FROM tasks WHERE id=1').fetchone()
+    assert task['title']==data['title'] and json.loads(task['question_ids'])==[3,4] and task['threshold']==50
+    invalid={**data,'ends':'1999-01-01T00:00'}
+    assert teacher.post('/tasks/1/edit',data=invalid).status_code==200
+    assert db.execute('SELECT ends FROM tasks WHERE id=1').fetchone()[0]==data['ends']
+    student=client(app,4);path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    html=teacher.get('/tasks/1/edit').get_data(as_text=True)
+    assert '题目与达标率已锁定' in html and 'name="selection"' not in html
+    assert teacher.post('/tasks/1/edit',data={**data,'threshold':100,'questions':['1','2']}).status_code==200
+    task=db.execute('SELECT * FROM tasks WHERE id=1').fetchone()
+    assert json.loads(task['question_ids'])==[3,4] and task['threshold']==50
+    assert teacher.post('/tasks/1/edit',data=dict(csrf='token',title='只修改名称时间',starts=data['starts'],ends=data['ends'])).status_code==302
+    answer=db.execute('SELECT answer FROM questions WHERE id=3').fetchone()[0]
+    student.post(path,data={'csrf':'token','3':answer})
+    a=db.execute('SELECT * FROM attempts WHERE task_id=1').fetchone()
+    assert a['total']==2 and a['score']==1 and a['passed']==1
+
+
+def test_daily_task_delete_restore_preserves_active_attempt(env):
+    app,db=env;teacher=client(app,2);student=client(app,4)
+    db.execute('UPDATE tasks SET title="要删除的测试练习" WHERE id=1');db.commit()
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    assert client(app,3).post('/tasks/1/delete',data={'csrf':'token'}).status_code==403
+    assert client(app,4).post('/tasks/1/delete',data={'csrf':'token'}).status_code==403
+    assert teacher.post('/tasks/2/delete',data={'csrf':'token'}).status_code==400
+    assert teacher.post('/tasks/1/delete',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM tasks WHERE id=1').fetchone()[0]
+    assert '要删除的测试练习' not in student.get('/').get_data(as_text=True)
+    assert '要删除的测试练习' in teacher.get('/classes/1?tasks=deleted').get_data(as_text=True)
+    assert client(app,5).post('/tasks/1/start',data={'csrf':'token'}).status_code==400
+    assert teacher.get('/tasks/1/edit').status_code==400
+    answers={str(q['id']):q['answer'] for q in db.execute('SELECT * FROM questions WHERE id IN (1,2)')}
+    assert student.post(path,data={'csrf':'token',**answers}).status_code==302
+    a=db.execute('SELECT * FROM attempts WHERE task_id=1').fetchone()
+    assert a['score']==2 and a['passed']==1
+    assert teacher.post('/tasks/1/restore',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT deleted_at FROM tasks WHERE id=1').fetchone()[0] is None
+    assert teacher.get('/tasks/1/progress?format=json').json[0]['completed']==1
+    assert '要删除的测试练习' in student.get('/').get_data(as_text=True)
+
+
+def test_task_edit_and_first_start_are_serialized(env):
+    app,db=env
+    for i in range(3):
+        tid=db.execute('INSERT INTO tasks(class_id,title,kind,question_ids,starts,ends,duration,threshold) VALUES(1,?,"daily","[1,2]","2000-01-01T00:00","2099-01-01T00:00",40,100)',('并发测试'+str(i),)).lastrowid;db.commit()
+        barrier=Barrier(2)
+        def edit():
+            c=client(app,2);barrier.wait()
+            return c.post(f'/tasks/{tid}/edit',data=dict(csrf='token',title='修改题组',starts='2000-01-01T00:00',ends='2099-01-01T00:00',selection='manual',questions=['3','4'],threshold=50)).status_code
+        def start():
+            c=client(app,4);barrier.wait()
+            return c.post(f'/tasks/{tid}/start',data={'csrf':'token'}).status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            edit_future=pool.submit(edit);start_future=pool.submit(start)
+            assert edit_future.result() in (200,302) and start_future.result()==302
+        task=db.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone()
+        a=db.execute('SELECT * FROM attempts WHERE task_id=?',(tid,)).fetchone()
+        assert json.loads(a['question_ids'])==json.loads(task['question_ids'])
+
+
+def test_existing_database_gets_student_and_task_trash_columns(env):
+    app,db=env
+    db.execute('ALTER TABLE users DROP COLUMN deleted_at');db.execute('ALTER TABLE tasks DROP COLUMN deleted_at');db.commit()
+    upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']})
+    assert client(upgraded,2).get('/classes/1').status_code==200
+    assert client(upgraded,4).get('/').status_code==200
+    assert db.execute('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL').fetchone()[0]==5

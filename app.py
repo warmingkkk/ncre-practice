@@ -50,6 +50,49 @@ def create_app(config=None):
     def task_status(record):
         return '已达标' if record['completed'] else ('作答中' if record['active'] else ('待达标' if record['attempts'] else '未作答'))
 
+    def managed_student(uid, deleted=False):
+        student=one('SELECT * FROM users WHERE id=? AND role="student"',(uid,))
+        if not student: abort(404)
+        classroom(student['class_id']);require_teacher()
+        if student['deleted_at'] and not deleted: abort(404)
+        return student
+
+    def available_classes():
+        return rows('SELECT id,name FROM classes ORDER BY name') if g.user['role']=='admin' else rows('SELECT id,name FROM classes WHERE teacher_id=? ORDER BY name',(g.user['id'],))
+
+    def task_configuration(form, existing=None, locked=False):
+        title=form.get('title','').strip()
+        kind=existing['kind'] if existing else form.get('kind','daily')
+        starts=datetime.fromisoformat(form.get('starts',''))
+        ends=datetime.fromisoformat(form.get('ends',''))
+        if not title or len(title)>100 or kind not in ('daily','exam') or starts.tzinfo or ends.tzinfo or ends<=starts:
+            raise ValueError('请检查任务名称和开放时间')
+        if locked:
+            if ('threshold' in form and int(form['threshold'])!=existing['threshold']) or any(k in form for k in ('selection','category','count')):
+                raise ValueError('已有学生开始作答，题目和达标率已锁定；如需更换请重新发布练习')
+            if 'questions' in form and list(dict.fromkeys(int(x) for x in form.getlist('questions')))!=json.loads(existing['question_ids']):
+                raise ValueError('已有学生开始作答，不能更换题目')
+            ids=json.loads(existing['question_ids']);threshold=existing['threshold'];duration=existing['duration']
+        else:
+            threshold=int(form.get('threshold',existing['threshold'] if existing else 100))
+            duration=int(form.get('duration',existing['duration'] if existing else 40))
+            ids=list(dict.fromkeys(int(x) for x in form.getlist('questions')))
+            selection=form.get('selection','keep' if existing else ('manual' if ids else 'random'))
+            if selection=='keep' and existing:
+                ids=json.loads(existing['question_ids'])
+            elif selection=='manual':
+                if not ids or len(ids)>100 or any(not one('SELECT id FROM questions WHERE id=? AND deleted_at IS NULL',(qid,)) for qid in ids):
+                    raise ValueError('请选择1至100道有效题目；已删除题目不能重新加入')
+            elif selection=='random':
+                count=int(form.get('count',20));cat=form.get('category','')
+                if not 1<=count<=100: raise ValueError('随机题数应为1至100')
+                ids=[r['id'] for r in rows('SELECT id FROM questions WHERE deleted_at IS NULL AND (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))]
+                if len(ids)<count: raise ValueError('该分类题量不足')
+            else:
+                raise ValueError('请选择有效的组题方式')
+        if not 1<=threshold<=100 or not 1<=duration<=240: raise ValueError('请检查达标率或考试时长')
+        return dict(title=title,kind=kind,starts=starts.isoformat(timespec='minutes'),ends=ends.isoformat(timespec='minutes'),duration=duration,threshold=threshold,question_ids=json.dumps(ids))
+
     def require_teacher():
         if g.user['role'] not in ('admin','teacher'):
             abort(403)
@@ -80,7 +123,7 @@ def create_app(config=None):
     @app.before_request
     def guard():
         g.user = one('SELECT * FROM users WHERE id=?',(session.get('uid'),)) if session.get('uid') else None
-        if g.user and session.get('version',0)!=g.user['session_version']:
+        if g.user and (g.user['deleted_at'] or session.get('version',0)!=g.user['session_version']):
             session.clear();g.user=None
         session.setdefault('csrf', secrets.token_hex(24))
         if request.method == 'POST' and not secrets.compare_digest(str(request.form.get('csrf') or request.headers.get('X-CSRF-Token','')), session['csrf']):
@@ -125,7 +168,7 @@ def create_app(config=None):
             if lock and lock['until']>time.time():
                 flash('尝试次数过多，请15分钟后重试')
                 return render_template('login.html'),429
-            u=one('SELECT * FROM users WHERE username=?',(username,))
+            u=one('SELECT * FROM users WHERE username=? AND deleted_at IS NULL',(username,))
             if u and check_password_hash(u['password'],request.form.get('password','')):
                 db().execute('DELETE FROM login_limits WHERE username=?',(key,)); db().commit()
                 session.clear(); session['uid']=u['id']; session['version']=u['session_version']; session.permanent=True
@@ -163,7 +206,7 @@ def create_app(config=None):
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE teacher_id=?',(g.user['id'],))
         else:
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE c.id=?',(g.user['class_id'],))
-        tasks=[dict(r) for r in rows('SELECT t.*,c.name class_name,COUNT(a.submitted) attempts,COALESCE(MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END),0) active,COALESCE(MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END),0) completed FROM tasks t JOIN classes c ON c.id=t.class_id LEFT JOIN attempts a ON a.task_id=t.id AND a.user_id=? WHERE c.id IN (%s) GROUP BY t.id ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))]
+        tasks=[dict(r) for r in rows('SELECT t.*,c.name class_name,COUNT(a.submitted) attempts,COALESCE(MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END),0) active,COALESCE(MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END),0) completed FROM tasks t JOIN classes c ON c.id=t.class_id LEFT JOIN attempts a ON a.task_id=t.id AND a.user_id=? WHERE t.deleted_at IS NULL AND c.id IN (%s) GROUP BY t.id ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))]
         for task in tasks: task['status']=task_status(task)
         stats=one('SELECT COUNT(*) attempts,COALESCE(SUM(score),0) correct,COALESCE(SUM(total),0) total FROM attempts WHERE user_id=? AND submitted IS NOT NULL',(g.user['id'],))
         wrong=one('SELECT COUNT(*) n FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE m.user_id=? AND m.mastered=0 AND q.deleted_at IS NULL',(g.user['id'],))['n']
@@ -255,8 +298,16 @@ def create_app(config=None):
 
     def new_attempt(ids, task=None):
         try:
-            cur=db().execute('INSERT INTO attempts(user_id,task_id,exam_task_id,question_ids,total,started,deadline) VALUES(?,?,?,?,?,?,?)',(g.user['id'],task['id'] if task else None,task['id'] if task and task['kind']=='exam' else None,json.dumps(ids),len(ids),time.time(),min(time.time()+task['duration']*60, datetime.fromisoformat(task['ends']).replace(tzinfo=timezone(timedelta(hours=8))).timestamp()) if task and task['kind']=='exam' else None))
-            db().commit()
+            with db():
+                if task:
+                    db().execute('BEGIN IMMEDIATE')
+                    task=one('SELECT * FROM tasks WHERE id=?',(task['id'],))
+                    student=one('SELECT * FROM users WHERE id=?',(g.user['id'],))
+                    if not task or task['deleted_at']: abort(400,'该任务已删除，不能开始新的作答')
+                    if student['deleted_at'] or student['class_id']!=task['class_id']: abort(403)
+                    if now()<task['starts'] or now()>=task['ends']: abort(400,'当前不在开放时间内')
+                    ids=json.loads(task['question_ids'])
+                cur=db().execute('INSERT INTO attempts(user_id,task_id,exam_task_id,question_ids,total,started,deadline) VALUES(?,?,?,?,?,?,?)',(g.user['id'],task['id'] if task else None,task['id'] if task and task['kind']=='exam' else None,json.dumps(ids),len(ids),time.time(),min(time.time()+task['duration']*60, datetime.fromisoformat(task['ends']).replace(tzinfo=timezone(timedelta(hours=8))).timestamp()) if task and task['kind']=='exam' else None))
             return cur.lastrowid
         except sqlite3.IntegrityError:
             db().rollback()
@@ -268,6 +319,7 @@ def create_app(config=None):
     def start_task(tid):
         t=task_access(tid)
         if g.user['role']!='student': abort(403)
+        if t['deleted_at']: abort(400,'该任务已删除，不能开始新的作答')
         if now()<t['starts'] or now()>=t['ends']: abort(400,'当前不在开放时间内')
         old=one('SELECT * FROM attempts WHERE task_id=? AND user_id=? ORDER BY id DESC LIMIT 1',(tid,g.user['id']))
         if old and (old['submitted'] is None or t['kind']=='exam'):
@@ -366,8 +418,51 @@ def create_app(config=None):
     @app.route('/classes/<int:cid>')
     def class_detail(cid):
         c=classroom(cid);require_teacher()
-        students=rows('SELECT id,username,name,must_change FROM users WHERE class_id=? AND role="student" ORDER BY username',(cid,))
-        return render_template('class.html',classroom=c,students=students,tasks=rows('SELECT * FROM tasks WHERE class_id=? ORDER BY id DESC',(cid,)),categories=rows('SELECT category,COUNT(*) n FROM questions WHERE deleted_at IS NULL GROUP BY category'),questions=rows('SELECT id,category,stem FROM questions WHERE deleted_at IS NULL ORDER BY id'))
+        deleted_students=request.args.get('students')=='deleted';deleted_tasks=request.args.get('tasks')=='deleted'
+        students=rows('SELECT id,username,name,must_change,deleted_at FROM users WHERE class_id=? AND role="student" AND (deleted_at IS NOT NULL)=? ORDER BY username',(cid,int(deleted_students)))
+        return render_template('class.html',classroom=c,students=students,deleted_students=deleted_students,deleted_tasks=deleted_tasks,tasks=rows('SELECT * FROM tasks WHERE class_id=? AND (deleted_at IS NOT NULL)=? ORDER BY id DESC',(cid,int(deleted_tasks))),categories=rows('SELECT category,COUNT(*) n FROM questions WHERE deleted_at IS NULL GROUP BY category'),questions=rows('SELECT id,category,stem FROM questions WHERE deleted_at IS NULL ORDER BY id'))
+
+    @app.route('/students/<int:uid>/edit',methods=['GET','POST'])
+    def student_edit(uid):
+        require_teacher();student=managed_student(uid)
+        if request.method=='POST':
+            try:
+                name=request.form.get('name','').strip();number=request.form.get('number','').strip();cid=int(request.form.get('class_id',student['class_id']))
+                if not 1<=len(name)<=80 or not 1<=len(number)<=100: raise ValueError('姓名和学号不能为空，姓名最多80字，学号最多100字')
+                with db():
+                    db().execute('BEGIN IMMEDIATE');student=managed_student(uid);classroom(cid)
+                    changed_login=number!=student['username'] or cid!=student['class_id']
+                    db().execute('UPDATE users SET name=?,username=?,class_id=?,session_version=session_version+? WHERE id=?',(name,number,cid,int(changed_login),uid))
+                    if changed_login: db().execute('DELETE FROM login_limits WHERE username IN (?,?)',(student['username'][:100],number[:100]))
+                    audit('修改学生 '+str(uid))
+                flash('学生信息已保存'+('，学号或班级已变更，请让该学生重新登录' if changed_login else ''))
+                return redirect(url_for('class_detail',cid=cid))
+            except sqlite3.IntegrityError:
+                flash('该学号已被其他账号使用，包括回收站中的账号')
+            except ValueError as e: flash(str(e))
+        return render_template('student_edit.html',student=student,form=request.form if request.method=='POST' else {},classes=available_classes())
+
+    @app.post('/students/<int:uid>/delete')
+    def student_delete(uid):
+        require_teacher()
+        with db():
+            db().execute('BEGIN IMMEDIATE');student=managed_student(uid,deleted=True)
+            changed=db().execute('UPDATE users SET deleted_at=?,session_version=session_version+1 WHERE id=? AND deleted_at IS NULL',(now(),uid)).rowcount
+            if changed: audit('删除学生 '+str(uid))
+        flash('学生已移入回收站并停用登录，历史成绩保留')
+        return redirect(url_for('class_detail',cid=student['class_id']))
+
+    @app.post('/students/<int:uid>/restore')
+    def student_restore(uid):
+        require_teacher()
+        with db():
+            db().execute('BEGIN IMMEDIATE');student=managed_student(uid,deleted=True)
+            changed=db().execute('UPDATE users SET deleted_at=NULL WHERE id=? AND deleted_at IS NOT NULL',(uid,)).rowcount
+            if changed:
+                db().execute('DELETE FROM login_limits WHERE username=?',(student['username'][:100],))
+                audit('恢复学生 '+str(uid))
+        flash('学生已恢复，仍使用删除前的密码；忘记时可重置为123456')
+        return redirect(url_for('class_detail',cid=student['class_id']))
 
     @app.post('/classes/<int:cid>/students')
     def students_import(cid):
@@ -387,9 +482,11 @@ def create_app(config=None):
                     old=one('SELECT * FROM users WHERE username=?',(r['number'],))
                     if old:
                         if old['class_id']!=cid or old['role']!='student': raise ValueError('学号已被其他账号使用：'+r['number'])
+                        if old['deleted_at']: raise ValueError('该学号在学生回收站中，请先恢复：'+r['number'])
                         continue
                     password=STUDENT_INITIAL_PASSWORD
                     db().execute('INSERT INTO users(username,name,password,role,class_id,must_change) VALUES(?,?,?,?,?,1)',(r['number'],r['name'],generate_password_hash(password),'student',cid))
+                    db().execute('DELETE FROM login_limits WHERE username=?',(r['number'][:100],))
                     credentials.append(dict(username=r['number'],name=r['name'],password=password))
                 audit(f'导入学生 {len(credentials)} 人')
         except Exception as e:
@@ -399,7 +496,7 @@ def create_app(config=None):
     @app.post('/users/<int:uid>/reset')
     def reset(uid):
         require_teacher()
-        u=one('SELECT * FROM users WHERE id=?',(uid,))
+        u=one('SELECT * FROM users WHERE id=? AND deleted_at IS NULL',(uid,))
         if not u: abort(404)
         if g.user['role']!='admin':
             if u['role']!='student' or not u['class_id']: abort(403)
@@ -419,29 +516,60 @@ def create_app(config=None):
     def publish(cid):
         classroom(cid);require_teacher()
         try:
-            title=request.form.get('title','').strip()[:100]
-            kind=request.form.get('kind','daily')
-            starts=request.form['starts'];ends=request.form['ends']
-            if kind not in ('daily','exam') or not title or datetime.fromisoformat(ends)<=datetime.fromisoformat(starts): raise ValueError('请检查标题和开放时间')
-            duration=int(request.form.get('duration',40));threshold=int(request.form.get('threshold',100));count=int(request.form.get('count',20))
-            if not 1<=duration<=240 or not 1<=threshold<=100 or not 1<=count<=100: raise ValueError('数量、时长或达标率超出范围')
-            ids=list(dict.fromkeys(int(x) for x in request.form.getlist('questions')))
-            cat=request.form.get('category','')
-            if ids:
-                if len(ids)>100 or any(not one('SELECT id FROM questions WHERE id=? AND deleted_at IS NULL',(qid,)) for qid in ids): raise ValueError('题目无效或已被删除，请刷新后重新选题')
-            else:
-                ids=[r['id'] for r in rows('SELECT id FROM questions WHERE deleted_at IS NULL AND (?="" OR category=?) ORDER BY RANDOM() LIMIT ?',(cat,cat,count))]
-                if len(ids)<count: raise ValueError('该分类题量不足')
-            db().execute('INSERT INTO tasks(class_id,title,kind,question_ids,starts,ends,duration,threshold) VALUES(?,?,?,?,?,?,?,?)',(cid,title,kind,json.dumps(ids),starts,ends,duration,threshold));audit('发布任务 '+title);db().commit()
+            settings=task_configuration(request.form)
+            db().execute('INSERT INTO tasks(class_id,title,kind,question_ids,starts,ends,duration,threshold) VALUES(?,?,?,?,?,?,?,?)',(cid,settings['title'],settings['kind'],settings['question_ids'],settings['starts'],settings['ends'],settings['duration'],settings['threshold']));audit('发布任务 '+settings['title']);db().commit()
             flash('发布成功，全班使用同一组题目')
         except (ValueError,KeyError) as e: flash(str(e))
         return redirect(url_for('class_detail',cid=cid))
+
+    @app.route('/tasks/<int:tid>/edit',methods=['GET','POST'])
+    def task_edit(tid):
+        require_teacher();task=task_access(tid)
+        if task['kind']!='daily' or task['deleted_at']: abort(400,'仅可修改尚未删除的每日练习')
+        locked=one('SELECT id FROM attempts WHERE task_id=? LIMIT 1',(tid,)) is not None
+        if request.method=='POST':
+            try:
+                with db():
+                    db().execute('BEGIN IMMEDIATE');task=task_access(tid)
+                    if task['deleted_at']: abort(400,'任务已删除，请先恢复')
+                    locked=one('SELECT id FROM attempts WHERE task_id=? LIMIT 1',(tid,)) is not None
+                    settings=task_configuration(request.form,task,locked)
+                    db().execute('UPDATE tasks SET title=?,question_ids=?,starts=?,ends=?,threshold=? WHERE id=?',(settings['title'],settings['question_ids'],settings['starts'],settings['ends'],settings['threshold'],tid))
+                    audit('修改每日练习 '+str(tid))
+                flash('每日练习已保存');return redirect(url_for('class_detail',cid=task['class_id']))
+            except ValueError as e: flash(str(e))
+        selected=json.loads(task['question_ids'])
+        if request.method=='POST' and not locked and request.form.get('selection')=='manual':
+            selected=[int(value) for value in request.form.getlist('questions') if value.isdecimal()]
+        return render_template('task_edit.html',task=task,locked=locked,form=request.form if request.method=='POST' else {},selected=selected,current_count=len(json.loads(task['question_ids'])),questions=rows('SELECT id,category,stem FROM questions WHERE deleted_at IS NULL ORDER BY id'),categories=rows('SELECT DISTINCT category FROM questions WHERE deleted_at IS NULL ORDER BY category'))
+
+    @app.post('/tasks/<int:tid>/delete')
+    def task_delete(tid):
+        require_teacher()
+        with db():
+            db().execute('BEGIN IMMEDIATE');task=task_access(tid)
+            if task['kind']!='daily': abort(400,'该入口仅用于每日练习')
+            changed=db().execute('UPDATE tasks SET deleted_at=? WHERE id=? AND deleted_at IS NULL',(now(),tid)).rowcount
+            if changed: audit('删除每日练习 '+str(tid))
+        flash('每日练习已移入回收站，不再接受新作答；已有答卷保留')
+        return redirect(url_for('class_detail',cid=task['class_id']))
+
+    @app.post('/tasks/<int:tid>/restore')
+    def task_restore(tid):
+        require_teacher()
+        with db():
+            db().execute('BEGIN IMMEDIATE');task=task_access(tid)
+            if task['kind']!='daily': abort(400,'该入口仅用于每日练习')
+            changed=db().execute('UPDATE tasks SET deleted_at=NULL WHERE id=? AND deleted_at IS NOT NULL',(tid,)).rowcount
+            if changed: audit('恢复每日练习 '+str(tid))
+        flash('每日练习已恢复，原有答卷和完成状态保留')
+        return redirect(url_for('class_detail',cid=task['class_id']))
 
     def progress_data(t):
         # Finalize expired exams from saved answers, even when students close the browser.
         for a in rows('SELECT * FROM attempts WHERE task_id=? AND submitted IS NULL AND deadline<=?',(t['id'],time.time())):
             grade(a,json.loads(a['answers']))
-        data=[dict(r) for r in rows('SELECT u.id,u.username,u.name,COUNT(a.submitted) attempts,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.score END) best,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END) completed,MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END) active FROM users u LEFT JOIN attempts a ON a.user_id=u.id AND a.task_id=? WHERE u.class_id=? AND u.role="student" GROUP BY u.id ORDER BY u.username',(t['id'],t['class_id']))]
+        data=[dict(r) for r in rows('SELECT u.id,u.username,u.name,COUNT(a.submitted) attempts,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.score END) best,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END) completed,MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END) active FROM users u LEFT JOIN attempts a ON a.user_id=u.id AND a.task_id=? WHERE u.class_id=? AND u.role="student" AND u.deleted_at IS NULL GROUP BY u.id ORDER BY u.username',(t['id'],t['class_id']))]
         for student in data: student['status']=task_status(student)
         return data
 
@@ -468,10 +596,13 @@ def create_app(config=None):
     @app.route('/admin')
     def admin():
         if g.user['role']!='admin': abort(403)
-        return render_template('admin.html',users=rows('SELECT id,username,name,role FROM users ORDER BY id'),logs=rows('SELECT a.*,u.name FROM audit a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 100'))
+        return render_template('admin.html',users=rows('SELECT id,username,name,role FROM users WHERE deleted_at IS NULL ORDER BY id'),logs=rows('SELECT a.*,u.name FROM audit a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 100'))
 
     with app.app_context():
         db().executescript(SCHEMA)
+        for table in ('users','tasks'):
+            if 'deleted_at' not in {r['name'] for r in rows('PRAGMA table_info('+table+')')}:
+                db().execute('ALTER TABLE '+table+' ADD COLUMN deleted_at TEXT')
         if 'deleted_at' not in {r['name'] for r in rows('PRAGMA table_info(questions)')}:
             db().execute('ALTER TABLE questions ADD COLUMN deleted_at TEXT')
         db().execute('CREATE INDEX IF NOT EXISTS active_question_categories ON questions(deleted_at,category)')
@@ -501,9 +632,9 @@ def insert_question(db,q):
 
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,teacher_id INTEGER REFERENCES users(id));
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),class_id INTEGER REFERENCES classes(id),must_change INTEGER NOT NULL DEFAULT 1,session_version INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),class_id INTEGER REFERENCES classes(id),must_change INTEGER NOT NULL DEFAULT 1,session_version INTEGER NOT NULL DEFAULT 0,deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY,category TEXT NOT NULL,stem TEXT NOT NULL,options TEXT NOT NULL,answer TEXT NOT NULL,explanation TEXT NOT NULL,deleted_at TEXT,UNIQUE(category,stem,options,answer,explanation));
-CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,class_id INTEGER NOT NULL REFERENCES classes(id),title TEXT NOT NULL,kind TEXT NOT NULL,question_ids TEXT NOT NULL,starts TEXT NOT NULL,ends TEXT NOT NULL,duration INTEGER NOT NULL,threshold INTEGER NOT NULL DEFAULT 100);
+CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,class_id INTEGER NOT NULL REFERENCES classes(id),title TEXT NOT NULL,kind TEXT NOT NULL,question_ids TEXT NOT NULL,starts TEXT NOT NULL,ends TEXT NOT NULL,duration INTEGER NOT NULL,threshold INTEGER NOT NULL DEFAULT 100,deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),task_id INTEGER REFERENCES tasks(id),exam_task_id INTEGER REFERENCES tasks(id),question_ids TEXT NOT NULL,answers TEXT NOT NULL DEFAULT '{}',total INTEGER NOT NULL,score INTEGER,passed INTEGER DEFAULT 0,started REAL NOT NULL,deadline REAL,submitted REAL,mistakes_synced INTEGER NOT NULL DEFAULT 0,UNIQUE(user_id,exam_task_id));
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_task ON attempts(user_id,task_id) WHERE submitted IS NULL AND task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS attempt_progress ON attempts(task_id,user_id,submitted);

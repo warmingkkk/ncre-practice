@@ -1,11 +1,12 @@
 {
   "users": 300,
   "requests": 1800,
-  "elapsed_seconds": 9.61,
-  "requests_per_second": 187.37,
-  "p50_ms": 1575.8,
-  "p95_ms": 2028.3,
+  "elapsed_seconds": 9.32,
+  "requests_per_second": 193.15,
+  "p50_ms": 1588.7,
+  "p95_ms": 1822.5,
   "errors": [],
   "submitted": 300,
-  "environment": "Local Windows, Waitress 8 threads, SQLite WAL; synthetic signed sessions; excludes password hashing and TLS; not a 2GB server benchmark"
+  "real_password_login": false,
+  "environment": "Local Windows, Waitress 8 threads, SQLite WAL; synthetic signed sessions; excludes password hashing; excludes TLS; not a 2GB server benchmark"
 }
