@@ -47,6 +47,9 @@ def create_app(config=None):
     def now():
         return datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%dT%H:%M')
 
+    def task_status(record):
+        return '已达标' if record['completed'] else ('作答中' if record['active'] else ('待达标' if record['attempts'] else '未作答'))
+
     def require_teacher():
         if g.user['role'] not in ('admin','teacher'):
             abort(403)
@@ -126,7 +129,7 @@ def create_app(config=None):
             if u and check_password_hash(u['password'],request.form.get('password','')):
                 db().execute('DELETE FROM login_limits WHERE username=?',(key,)); db().commit()
                 session.clear(); session['uid']=u['id']; session['version']=u['session_version']; session.permanent=True
-                return redirect('/')
+                return redirect(url_for('password' if u['must_change'] else 'home'))
             count=(lock['failures'] if lock else 0)+1
             db().execute('INSERT OR REPLACE INTO login_limits VALUES(?,?,?)',(key,count,time.time()+900 if count>=8 else 0));db().commit()
             flash('账号或密码不正确')
@@ -160,7 +163,8 @@ def create_app(config=None):
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE teacher_id=?',(g.user['id'],))
         else:
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE c.id=?',(g.user['class_id'],))
-        tasks=rows('SELECT t.*,c.name class_name,EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=t.id AND a.user_id=? AND a.submitted IS NOT NULL AND a.passed=1) completed FROM tasks t JOIN classes c ON c.id=t.class_id WHERE c.id IN (%s) ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))
+        tasks=[dict(r) for r in rows('SELECT t.*,c.name class_name,COUNT(a.submitted) attempts,COALESCE(MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END),0) active,COALESCE(MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END),0) completed FROM tasks t JOIN classes c ON c.id=t.class_id LEFT JOIN attempts a ON a.task_id=t.id AND a.user_id=? WHERE c.id IN (%s) GROUP BY t.id ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))]
+        for task in tasks: task['status']=task_status(task)
         stats=one('SELECT COUNT(*) attempts,COALESCE(SUM(score),0) correct,COALESCE(SUM(total),0) total FROM attempts WHERE user_id=? AND submitted IS NOT NULL',(g.user['id'],))
         wrong=one('SELECT COUNT(*) n FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE m.user_id=? AND m.mastered=0 AND q.deleted_at IS NULL',(g.user['id'],))['n']
         return render_template('home.html',classes=classes,tasks=tasks,stats=stats,wrong=wrong,bank_count=one('SELECT COUNT(*) n FROM questions WHERE deleted_at IS NULL')['n'])
@@ -344,11 +348,16 @@ def create_app(config=None):
         name=request.form.get('name','').strip()[:100]
         username=request.form.get('username','').strip()[:100]
         if not name or not username: abort(400)
-        password=secrets.token_urlsafe(10)
+        password=request.form.get('initial_password','').strip()
+        if password and not 10<=len(password)<=128:
+            flash('班主任初始密码需为10至128位；也可以留空自动生成')
+            return redirect('/')
+        password=password or secrets.token_urlsafe(10)
         try:
             with db():
                 uid=db().execute('INSERT INTO users(username,name,password,role,must_change) VALUES(?,?,?,?,1)',(username,request.form.get('teacher','班主任').strip()[:80] or '班主任',generate_password_hash(password),'teacher')).lastrowid
                 cid=db().execute('INSERT INTO classes(name,teacher_id) VALUES(?,?)',(name,uid)).lastrowid
+                db().execute('DELETE FROM login_limits WHERE username=?',(username,))
                 audit('新建班级 '+name)
         except sqlite3.IntegrityError:
             flash('班级名称或班主任账号重复');return redirect('/')
@@ -395,7 +404,11 @@ def create_app(config=None):
         if g.user['role']!='admin':
             if u['role']!='student' or not u['class_id']: abort(403)
             classroom(u['class_id'])
-        password=STUDENT_INITIAL_PASSWORD if u['role']=='student' else secrets.token_urlsafe(10)
+        chosen=request.form.get('initial_password','').strip() if u['role']=='teacher' else ''
+        if chosen and not 10<=len(chosen)<=128:
+            flash('班主任初始密码需为10至128位；也可以留空自动生成')
+            return redirect('/admin')
+        password=STUDENT_INITIAL_PASSWORD if u['role']=='student' else (chosen or secrets.token_urlsafe(10))
         with db():
             db().execute('UPDATE users SET password=?,must_change=1,session_version=session_version+1 WHERE id=?',(generate_password_hash(password),uid))
             db().execute('DELETE FROM login_limits WHERE username=?',(u['username'][:100],))
@@ -428,7 +441,9 @@ def create_app(config=None):
         # Finalize expired exams from saved answers, even when students close the browser.
         for a in rows('SELECT * FROM attempts WHERE task_id=? AND submitted IS NULL AND deadline<=?',(t['id'],time.time())):
             grade(a,json.loads(a['answers']))
-        return [dict(r) for r in rows('SELECT u.id,u.username,u.name,COUNT(a.submitted) attempts,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.score END) best,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END) completed,MAX(CASE WHEN a.submitted IS NULL THEN 1 ELSE 0 END) active FROM users u LEFT JOIN attempts a ON a.user_id=u.id AND a.task_id=? WHERE u.class_id=? AND u.role="student" GROUP BY u.id ORDER BY u.username',(t['id'],t['class_id']))]
+        data=[dict(r) for r in rows('SELECT u.id,u.username,u.name,COUNT(a.submitted) attempts,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.score END) best,MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END) completed,MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END) active FROM users u LEFT JOIN attempts a ON a.user_id=u.id AND a.task_id=? WHERE u.class_id=? AND u.role="student" GROUP BY u.id ORDER BY u.username',(t['id'],t['class_id']))]
+        for student in data: student['status']=task_status(student)
+        return data
 
     @app.route('/tasks/<int:tid>/progress')
     def progress(tid):

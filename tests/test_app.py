@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -238,3 +239,84 @@ def test_student_password_reset_scope_and_unlock(env,actor):
     with c.session_transaction() as s:token=s['csrf']
     assert c.post('/login',data={'csrf':token,'username':'4','password':'123456'}).status_code==302
     assert c.get('/').location.endswith('/password')
+
+
+def test_new_task_is_unanswered_until_student_starts(env):
+    app,db=env;teacher=client(app,2)
+    form=dict(csrf='token',title='新发布任务状态测试',kind='daily',starts='2000-01-01T00:00',ends='2099-01-01T00:00',duration=40,threshold=100,count=2,questions=['1','2'])
+    teacher.post('/classes/1/tasks',data=form)
+    tid=db.execute('SELECT MAX(id) FROM tasks').fetchone()[0]
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE task_id=?',(tid,)).fetchone()[0]==0
+    for _ in range(2):
+        assert client(app,4).get('/').status_code==200
+        progress=teacher.get(f'/tasks/{tid}/progress?format=json').json
+        assert all(s['active']==0 and s['attempts']==0 for s in progress)
+        assert all(s['status']=='未作答' for s in progress)
+        assert '未作答' in teacher.get(f'/tasks/{tid}/progress').get_data(as_text=True)
+        assert '未作答' in client(app,4).get('/').get_data(as_text=True)
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE task_id=?',(tid,)).fetchone()[0]==0
+    student=client(app,4)
+    path=student.post(f'/tasks/{tid}/start',data={'csrf':'token'}).location
+    progress=teacher.get(f'/tasks/{tid}/progress?format=json').json
+    assert progress[0]['active']==1 and progress[1]['active']==0
+    assert progress[0]['status']=='作答中' and progress[1]['status']=='未作答'
+    assert '继续作答' in student.get('/').get_data(as_text=True)
+    student.post(path,data={'csrf':'token'})
+    progress=teacher.get(f'/tasks/{tid}/progress?format=json').json
+    assert progress[0]['active']==0 and progress[0]['attempts']==1
+    assert progress[1]['active']==0 and progress[1]['attempts']==0
+    assert progress[0]['status']=='待达标' and progress[1]['status']=='未作答'
+
+
+def test_created_teacher_login_and_forced_password_change(env):
+    app,db=env
+    response=client(app,1).post('/classes',data=dict(csrf='token',name='新班级',username='new-teacher',teacher='新班主任'))
+    assert response.status_code==200
+    initial=re.search(r'<code>([^<]+)</code>',response.get_data(as_text=True)).group(1)
+    assert initial!='123456'
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    invalid=c.post('/login',data=dict(csrf=token,username='new-teacher',password='123456'))
+    assert '账号或密码不正确' in invalid.get_data(as_text=True)
+    response=c.post('/login',data=dict(csrf=token,username='new-teacher',password=initial),follow_redirects=True)
+    assert response.request.path=='/password'
+    assert '已成功登录班主任账号 new-teacher' in response.get_data(as_text=True)
+    with c.session_transaction() as s:token=s['csrf']
+    response=c.post('/password',data=dict(csrf=token,old=initial,password='NewTeacherPassword123'),follow_redirects=True)
+    assert response.request.path=='/' and '新班级' in response.get_data(as_text=True)
+    cid=db.execute('SELECT id FROM classes WHERE name="新班级"').fetchone()[0]
+    assert c.get(f'/classes/{cid}').status_code==200
+
+
+def test_creating_teacher_clears_old_login_lock(env):
+    app,db=env
+    db.execute('INSERT INTO login_limits VALUES("new-teacher",8,?)',(time.time()+900,));db.commit()
+    response=client(app,1).post('/classes',data=dict(csrf='token',name='新班级',username='new-teacher',teacher='新班主任'))
+    initial=re.search(r'<code>([^<]+)</code>',response.get_data(as_text=True)).group(1)
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data=dict(csrf=token,username='new-teacher',password=initial)).status_code==302
+
+
+def test_admin_can_choose_and_reset_teacher_initial_password(env):
+    app,db=env;admin=client(app,1)
+    data=dict(csrf='token',name='指定密码班',username='chosen-teacher',teacher='指定教师',initial_password='123456')
+    admin.post('/classes',data=data)
+    assert db.execute('SELECT id FROM users WHERE username="chosen-teacher"').fetchone() is None
+    initial='TeacherInitial123'
+    response=admin.post('/classes',data={**data,'initial_password':initial})
+    assert response.status_code==200 and initial in response.get_data(as_text=True)
+    u=db.execute('SELECT * FROM users WHERE username="chosen-teacher"').fetchone()
+    assert u['must_change'] and check_password_hash(u['password'],initial)
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data=dict(csrf=token,username='chosen-teacher',password=initial),follow_redirects=True).request.path=='/password'
+    reset='TeacherReset456'
+    assert client(app,2).post(f'/users/{u["id"]}/reset',data=dict(csrf='token',initial_password=reset)).status_code==403
+    admin.post(f'/users/{u["id"]}/reset',data=dict(csrf='token',initial_password=reset))
+    updated=db.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone()
+    assert check_password_hash(updated['password'],reset) and updated['must_change']
+    assert c.get('/').location=='/login'
+    c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data=dict(csrf=token,username='chosen-teacher',password=reset),follow_redirects=True).request.path=='/password'
