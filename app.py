@@ -496,7 +496,7 @@ def create_app(config=None):
     def class_detail(cid):
         c=classroom(cid);require_teacher()
         deleted_students=request.args.get('students')=='deleted';deleted_tasks=request.args.get('tasks')=='deleted'
-        students=rows('SELECT id,username,name,must_change,deleted_at FROM users WHERE class_id=? AND role="student" AND (deleted_at IS NOT NULL)=? ORDER BY username',(cid,int(deleted_students)))
+        students=rows('SELECT id,username,original_username,name,must_change,deleted_at FROM users WHERE class_id=? AND role="student" AND (deleted_at IS NOT NULL)=? ORDER BY username',(cid,int(deleted_students)))
         return render_template('class.html',classroom=c,students=students,deleted_students=deleted_students,deleted_tasks=deleted_tasks,tasks=rows('SELECT * FROM tasks WHERE class_id=? AND (deleted_at IS NOT NULL)=? ORDER BY id DESC',(cid,int(deleted_tasks))),categories=rows('SELECT category,COUNT(*) n FROM questions WHERE deleted_at IS NULL GROUP BY category'),questions=rows('SELECT id,category,stem FROM questions WHERE deleted_at IS NULL ORDER BY id'))
 
     @app.route('/students/<int:uid>/edit',methods=['GET','POST'])
@@ -508,6 +508,7 @@ def create_app(config=None):
                 if not 1<=len(name)<=80 or not 1<=len(number)<=100: raise ValueError('姓名和学号不能为空，姓名最多80字，学号最多100字')
                 with db():
                     db().execute('BEGIN IMMEDIATE');student=managed_student(uid);classroom(cid)
+                    release_deleted_student_username(number)
                     changed_login=number!=student['username'] or cid!=student['class_id']
                     db().execute('UPDATE users SET name=?,username=?,class_id=?,session_version=session_version+? WHERE id=?',(name,number,cid,int(changed_login),uid))
                     if changed_login: db().execute('DELETE FROM login_limits WHERE username IN (?,?)',(student['username'][:100],number[:100]))
@@ -515,7 +516,7 @@ def create_app(config=None):
                 flash('学生信息已保存'+('，学号或班级已变更，请让该学生重新登录' if changed_login else ''))
                 return redirect(url_for('class_detail',cid=cid))
             except sqlite3.IntegrityError:
-                flash('该学号已被其他账号使用，包括回收站中的账号')
+                flash('该学号已被其他账号使用')
             except ValueError as e: flash(str(e))
         return render_template('student_edit.html',student=student,form=request.form if request.method=='POST' else {},classes=available_classes())
 
@@ -534,12 +535,24 @@ def create_app(config=None):
         require_teacher()
         with db():
             db().execute('BEGIN IMMEDIATE');student=managed_student(uid,deleted=True)
+            number=student['original_username'] or student['username']
+            if student['deleted_at'] and student['original_username']:
+                if one('SELECT id FROM users WHERE username=? AND id!=?',(number,uid)):
+                    flash('原学号已被其他账号使用，不能恢复该历史账号；当前账号和历史成绩均已保留')
+                    return redirect(url_for('class_detail',cid=student['class_id'],students='deleted'))
+                db().execute('UPDATE users SET username=?,original_username=NULL WHERE id=?',(number,uid))
             changed=db().execute('UPDATE users SET deleted_at=NULL WHERE id=? AND deleted_at IS NOT NULL',(uid,)).rowcount
             if changed:
-                db().execute('DELETE FROM login_limits WHERE username=?',(student['username'][:100],))
+                db().execute('DELETE FROM login_limits WHERE username=?',(number[:100],))
                 audit('恢复学生 '+str(uid))
         flash('学生已恢复，仍使用删除前的密码；忘记时可重置为123456')
         return redirect(url_for('class_detail',cid=student['class_id']))
+
+    def release_deleted_student_username(number):
+        old=one('SELECT id FROM users WHERE username=? AND role="student" AND deleted_at IS NOT NULL',(number,))
+        if old:
+            archived=number+'~deleted-'+str(old['id'])+'-'+secrets.token_hex(8)
+            db().execute('UPDATE users SET original_username=COALESCE(original_username,username),username=? WHERE id=?',(archived,old['id']))
 
     @app.post('/classes/<int:cid>/students')
     def students_import(cid):
@@ -557,10 +570,10 @@ def create_app(config=None):
             with db():
                 db().execute('BEGIN IMMEDIATE');classroom(cid)
                 for r in records:
+                    release_deleted_student_username(r['number'])
                     old=one('SELECT * FROM users WHERE username=?',(r['number'],))
                     if old:
                         if old['class_id']!=cid or old['role']!='student': raise ValueError('学号已被其他账号使用：'+r['number'])
-                        if old['deleted_at']: raise ValueError('该学号在学生回收站中，请先恢复：'+r['number'])
                         continue
                     password=STUDENT_INITIAL_PASSWORD
                     db().execute('INSERT INTO users(username,name,password,role,class_id,must_change) VALUES(?,?,?,?,?,1)',(r['number'],r['name'],generate_password_hash(password),'student',cid))
@@ -667,7 +680,7 @@ def create_app(config=None):
         if t['kind']!='exam': abort(400)
         if g.user['role']=='student' and now()<t['ends']: abort(403,'考试结束后开放排名')
         progress_data(t)
-        rank=rows('SELECT u.name,u.username,a.score,a.total,CAST(a.submitted-a.started AS INTEGER) elapsed FROM attempts a JOIN users u ON u.id=a.user_id WHERE task_id=? AND submitted IS NOT NULL ORDER BY score DESC,elapsed ASC,u.username',(tid,))
+        rank=rows('SELECT u.name,COALESCE(u.original_username,u.username) username,a.score,a.total,CAST(a.submitted-a.started AS INTEGER) elapsed FROM attempts a JOIN users u ON u.id=a.user_id WHERE task_id=? AND submitted IS NOT NULL ORDER BY score DESC,elapsed ASC,u.username',(tid,))
         return render_template('ranking.html',task=t,ranking=rank)
 
     @app.route('/admin')
@@ -683,6 +696,8 @@ def create_app(config=None):
         if 'deleted_at' not in {r['name'] for r in rows('PRAGMA table_info(questions)')}:
             db().execute('ALTER TABLE questions ADD COLUMN deleted_at TEXT')
         db().execute('CREATE INDEX IF NOT EXISTS active_question_categories ON questions(deleted_at,category)')
+        if 'original_username' not in {r['name'] for r in rows('PRAGMA table_info(users)')}:
+            db().execute('ALTER TABLE users ADD COLUMN original_username TEXT')
         if 'session_version' not in {r['name'] for r in rows('PRAGMA table_info(users)')}:
             db().execute('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
         if 'exam_task_id' not in {r['name'] for r in rows('PRAGMA table_info(attempts)')}:

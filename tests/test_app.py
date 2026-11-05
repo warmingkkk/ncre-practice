@@ -692,3 +692,54 @@ def test_reuse_deleted_class_name_edit_and_rollback_on_account_conflict(env):
     assert db.execute('SELECT name FROM classes WHERE id=2').fetchone()[0]=='测试班'
     assert db.execute('SELECT username FROM users WHERE id=3').fetchone()[0]=='teacher'
     assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0]
+
+
+def test_reimport_deleted_student_with_excel_keeps_history_and_initial_password(env):
+    app,db=env;teacher=client(app,2);student=client(app,4)
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    teacher.post('/students/4/delete',data={'csrf':'token'})
+    f=io.BytesIO();book=Workbook();sheet=book.active;sheet.append(['学号','姓名']);sheet.append(['4','重新导入学生']);book.save(f);f.seek(0)
+    r=teacher.post('/classes/1/students',data={'csrf':'token','file':(f,'students.xlsx')})
+    assert r.status_code==200 and '123456' in r.get_data(as_text=True)
+    new=db.execute('SELECT * FROM users WHERE username="4"').fetchone()
+    assert new['id']!=4 and new['must_change'] and not new['deleted_at']
+    assert check_password_hash(new['password'],'123456')
+    old=db.execute('SELECT * FROM users WHERE id=4').fetchone()
+    assert old['original_username']=='4' and old['deleted_at']
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE user_id=4').fetchone()[0]==1
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE user_id=?',(new['id'],)).fetchone()[0]==0
+    assert student.get('/').location=='/login'
+    html=teacher.get('/classes/1?students=deleted').get_data(as_text=True)
+    assert '<td>4</td>' in html and old['username'] not in html
+    r=teacher.post('/students/4/restore',data={'csrf':'token'},follow_redirects=True)
+    assert '原学号已被其他账号使用' in r.get_data(as_text=True)
+    assert db.execute('SELECT deleted_at FROM users WHERE id=4').fetchone()[0]
+
+
+def test_reimport_after_deleted_class_and_import_failure_rollback(env):
+    app,db=env;admin=client(app,1)
+    admin.post('/classes/1/delete',data={'csrf':'token'})
+    db.execute('INSERT INTO classes(id,name,teacher_id) VALUES(2,"新班",3)');db.commit()
+    old=db.execute('SELECT username FROM users WHERE id=4').fetchone()[0]
+    f=io.BytesIO();book=Workbook();sheet=book.active;sheet.append(['学号','姓名']);sheet.append(['4','新学生']);sheet.append(['admin','冲突']);book.save(f);f.seek(0)
+    r=admin.post('/classes/2/students',data={'csrf':'token','file':(f,'students.xlsx')},follow_redirects=True)
+    assert '导入失败' in r.get_data(as_text=True)
+    assert db.execute('SELECT username FROM users WHERE id=4').fetchone()[0]==old
+    assert db.execute('SELECT COUNT(*) FROM users WHERE class_id=2').fetchone()[0]==0
+    r=admin.post('/classes/2/students',data=dict(csrf='token',number='4',name='新学生'))
+    assert r.status_code==200
+    assert db.execute('SELECT class_id FROM users WHERE username="4"').fetchone()[0]==2
+
+
+def test_student_archive_migration_and_restore_when_number_is_free(env):
+    app,db=env
+    db.execute('ALTER TABLE users DROP COLUMN original_username');db.commit()
+    upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']});teacher=client(upgraded,2)
+    teacher.post('/students/4/delete',data={'csrf':'token'})
+    teacher.post('/classes/1/students',data=dict(csrf='token',number='4',name='新学生'))
+    uid=db.execute('SELECT id FROM users WHERE username="4"').fetchone()[0]
+    teacher.post(f'/students/{uid}/edit',data=dict(csrf='token',name='改学号',number='new4',class_id=1))
+    assert teacher.post('/students/4/restore',data={'csrf':'token'}).status_code==302
+    restored=db.execute('SELECT * FROM users WHERE id=4').fetchone()
+    assert restored['username']=='4' and restored['deleted_at'] is None and restored['original_username'] is None
