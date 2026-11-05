@@ -383,7 +383,7 @@ def test_daily_task_edit_before_and_after_start(env):
     assert teacher.get('/tasks/1/edit').status_code==200
     assert client(app,3).get('/tasks/1/edit').status_code==403
     assert client(app,4).post('/tasks/1/edit',data=data).status_code==403
-    assert teacher.get('/tasks/2/edit').status_code==400
+    assert teacher.get('/tasks/2/edit').status_code==200
     assert teacher.post('/tasks/1/edit',data=data).status_code==302
     task=db.execute('SELECT * FROM tasks WHERE id=1').fetchone()
     assert task['title']==data['title'] and json.loads(task['question_ids'])==[3,4] and task['threshold']==50
@@ -409,7 +409,6 @@ def test_daily_task_delete_restore_preserves_active_attempt(env):
     path=student.post('/tasks/1/start',data={'csrf':'token'}).location
     assert client(app,3).post('/tasks/1/delete',data={'csrf':'token'}).status_code==403
     assert client(app,4).post('/tasks/1/delete',data={'csrf':'token'}).status_code==403
-    assert teacher.post('/tasks/2/delete',data={'csrf':'token'}).status_code==400
     assert teacher.post('/tasks/1/delete',data={'csrf':'token'}).status_code==302
     assert db.execute('SELECT deleted_at FROM tasks WHERE id=1').fetchone()[0]
     assert '要删除的测试练习' not in student.get('/').get_data(as_text=True)
@@ -550,3 +549,76 @@ def test_old_cookie_alone_does_not_authenticate_after_cookie_rename(env):
     c.get('/login')
     with c.session_transaction() as s:token=s['csrf']
     assert c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True).request.path=='/'
+
+
+def test_exam_edit_locks_timing_and_questions_after_start(env):
+    app,db=env;teacher=client(app,2)
+    data=dict(csrf='token',title='新版模拟考',starts='2000-01-01T00:00',ends='2099-01-01T00:00',duration=20,threshold=50,selection='manual',questions=['3','4'])
+    assert client(app,3).post('/tasks/2/edit',data=data).status_code==403
+    assert client(app,4).post('/tasks/2/edit',data=data).status_code==403
+    assert teacher.post('/tasks/2/edit',data=data).status_code==302
+    assert db.execute('SELECT duration FROM tasks WHERE id=2').fetchone()[0]==20
+    student=client(app,4);path=student.post('/tasks/2/start',data={'csrf':'token'}).location
+    attempt=db.execute('SELECT * FROM attempts WHERE task_id=2').fetchone()
+    assert json.loads(attempt['question_ids'])==[3,4]
+    assert 1199<=attempt['deadline']-attempt['started']<=1201
+    for changes in ({'duration':21},{'ends':'2098-01-01T00:00'},{'starts':'2001-01-01T00:00'},{'questions':['1']},{'threshold':100}):
+        assert teacher.post('/tasks/2/edit',data={**dict(csrf='token',title='不应保存',starts=data['starts'],ends=data['ends']),**changes}).status_code==200
+        assert db.execute('SELECT title FROM tasks WHERE id=2').fetchone()[0]=='新版模拟考'
+    assert teacher.post('/tasks/2/edit',data=dict(csrf='token',title='更正考试名称')).status_code==200  # dates remain required
+    assert teacher.post('/tasks/2/edit',data=dict(csrf='token',title='更正考试名称',starts=data['starts'],ends=data['ends'],duration=20)).status_code==302
+    assert '/tasks/2/delete' in teacher.get('/classes/1').get_data(as_text=True)
+    assert teacher.post('/tasks/2/delete',data={'csrf':'token'}).status_code==302
+    assert client(app,5).post('/tasks/2/start',data={'csrf':'token'}).status_code==400
+    assert student.post(path,data={'csrf':'token'}).status_code==302
+    assert teacher.post('/tasks/2/restore',data={'csrf':'token'}).status_code==302
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE task_id=2').fetchone()[0]==1
+    assert student.post('/tasks/2/start',data={'csrf':'token'}).location==path
+
+
+def test_class_edit_and_delete_cascades_accounts_and_keeps_history(env):
+    app,db=env;admin=client(app,1);teacher=client(app,2);student=client(app,4)
+    original=db.execute('SELECT password FROM users WHERE id=2').fetchone()[0]
+    path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    data=dict(csrf='token',name='改名后的班级',teacher='新教师姓名',username='newteacher')
+    assert teacher.post('/classes/1/edit',data=data).status_code==403
+    assert admin.get('/classes/1/edit').status_code==200
+    assert admin.post('/classes/1/edit',data={**data,'username':'admin'}).status_code==200
+    assert db.execute('SELECT name FROM classes WHERE id=1').fetchone()[0]=='测试班'
+    assert admin.post('/classes/1/edit',data=data).status_code==302
+    assert teacher.get('/').location=='/login'
+    assert db.execute('SELECT password FROM users WHERE id=2').fetchone()[0]==original
+    assert db.execute('SELECT name FROM classes WHERE id=1').fetchone()[0]==data['name']
+    teacher=app.test_client();teacher.get('/login')
+    with teacher.session_transaction() as session:token=session['csrf']
+    assert teacher.post('/login',data=dict(csrf=token,username='newteacher',password='TestPassword123')).status_code==302
+    assert teacher.get('/classes/1').status_code==200
+    assert client(app,3).post('/classes/1/delete',data={'csrf':'token'}).status_code==403
+    assert student.post('/classes/1/delete',data={'csrf':'token'}).status_code==403
+    assert admin.post('/classes/1/delete',data={'csrf':'token'}).status_code==302
+    assert student.get('/').location=='/login' and teacher.get('/').location=='/login'
+    assert db.execute('SELECT COUNT(*) FROM users WHERE id IN (2,4,5) AND deleted_at IS NOT NULL').fetchone()[0]==3
+    assert db.execute('SELECT COUNT(*) FROM users WHERE id IN (1,3) AND deleted_at IS NULL').fetchone()[0]==2
+    assert db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]==1
+    assert db.execute('SELECT COUNT(*) FROM tasks WHERE deleted_at IS NOT NULL').fetchone()[0]==2
+    assert data['name'] not in admin.get('/').get_data(as_text=True)
+    for url in ('/classes/1','/classes/1/edit','/tasks/1/edit'):
+        assert admin.get(url).status_code==404
+    assert admin.post('/students/4/restore',data={'csrf':'token'}).status_code==404
+    assert admin.post('/classes/1/students',data=dict(csrf='token',number='6',name='不能新增')).status_code==404
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as session:token=session['csrf']
+    for username in ('newteacher','4','5'):
+        assert '账号或密码不正确' in c.post('/login',data=dict(csrf=token,username=username,password='TestPassword123')).get_data(as_text=True)
+
+
+def test_class_soft_delete_migration_and_shared_teacher_protection(env):
+    app,db=env
+    db.execute('ALTER TABLE classes DROP COLUMN deleted_at');db.commit()
+    upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']})
+    assert client(upgraded,1).get('/classes/1/edit').status_code==200
+    assert db.execute('SELECT COUNT(*) FROM classes WHERE deleted_at IS NULL').fetchone()[0]==1
+    db.execute('INSERT INTO classes(name,teacher_id) VALUES("同一班主任的另一个班",2)');db.commit()
+    assert client(upgraded,1).post('/classes/1/delete',data={'csrf':'token'}).status_code==400
+    assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0] is None
