@@ -452,3 +452,74 @@ def test_existing_database_gets_student_and_task_trash_columns(env):
     assert client(upgraded,2).get('/classes/1').status_code==200
     assert client(upgraded,4).get('/').status_code==200
     assert db.execute('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL').fetchone()[0]==5
+
+
+def test_upgrade_preserves_admin_password_and_login(env,monkeypatch):
+    app,db=env
+    original=db.execute('SELECT * FROM users WHERE username="admin"').fetchone()
+    counts={table:db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0] for table in ('classes','users','tasks')}
+    db.execute('ALTER TABLE users DROP COLUMN deleted_at');db.execute('ALTER TABLE tasks DROP COLUMN deleted_at');db.commit()
+    monkeypatch.setenv('ADMIN_PASSWORD','DifferentEnvironmentPassword123')
+    upgraded=create_app({'TESTING':True,'DATABASE':app.config['DATABASE']})
+    current=db.execute('SELECT * FROM users WHERE username="admin"').fetchone()
+    assert current['password']==original['password'] and current['id']==original['id']
+    assert check_password_hash(current['password'],'TestPassword123')
+    assert not check_password_hash(current['password'],'DifferentEnvironmentPassword123')
+    for table,count in counts.items(): assert db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0]==count
+    c=upgraded.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    response=c.post('/login',data=dict(csrf=token,username='admin',password='TestPassword123'),follow_redirects=True)
+    assert response.request.path=='/' and c.get('/admin').status_code==200
+
+
+def test_admin_console_recovery_backs_up_and_preserves_school_data(env):
+    from scripts.admin_access import status,reset_admin
+    app,db=env
+    student=client(app,4);path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    original=db.execute('SELECT password FROM users WHERE id=1').fetchone()[0]
+    student_password=db.execute('SELECT password FROM users WHERE id=4').fetchone()[0]
+    counts={table:db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0] for table in ('classes','users','tasks','attempts','questions','mistakes')}
+    old_admin=client(app,1)
+    db.execute('INSERT INTO login_limits VALUES("admin",8,?)',(time.time()+900,));db.commit()
+    info=status(app.config['DATABASE'],environment_password='TestPassword123')
+    assert info['locked'] and info['matches_environment_password']
+    result=reset_admin(app.config['DATABASE'],'admin','RecoveredAdminPassword123')
+    with sqlite3.connect(result['backup']) as backup:
+        assert backup.execute('SELECT password FROM users WHERE id=1').fetchone()[0]==original
+    for table,count in counts.items(): assert db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0]==count
+    assert db.execute('SELECT password FROM users WHERE id=4').fetchone()[0]==student_password
+    assert old_admin.get('/admin').location=='/login'
+    assert not status(app.config['DATABASE'])['locked']
+    c=app.test_client();c.get('/login')
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/login',data=dict(csrf=token,username='admin',password='RecoveredAdminPassword123'),follow_redirects=True).request.path=='/password'
+    with c.session_transaction() as s:token=s['csrf']
+    assert c.post('/password',data=dict(csrf=token,old='RecoveredAdminPassword123',password='NewAdminPassword456'),follow_redirects=True).request.path=='/'
+    assert c.get('/admin').status_code==200
+
+
+def test_admin_recovery_refuses_missing_database_and_other_roles(env,tmp_path):
+    from scripts.admin_access import status,reset_admin
+    app,db=env
+    missing=tmp_path/'missing.db'
+    with pytest.raises(ValueError): reset_admin(missing,'admin','RecoveryPassword123')
+    assert not missing.exists()
+    before=db.execute('SELECT password FROM users WHERE id=2').fetchone()[0]
+    with pytest.raises(ValueError): reset_admin(app.config['DATABASE'],'teacher','RecoveryPassword123')
+    assert db.execute('SELECT password FROM users WHERE id=2').fetchone()[0]==before
+    with pytest.raises(ValueError): reset_admin(app.config['DATABASE'],'admin','123456')
+
+
+def test_admin_recovery_cli_environment_password_is_not_printed(env,tmp_path,monkeypatch,capsys):
+    from scripts.admin_access import main
+    app,db=env
+    with sqlite3.connect(tmp_path/'practice.db') as target: db.backup(target)
+    password='EnvironmentRecoveryPassword123'
+    monkeypatch.setenv('ADMIN_PASSWORD',password)
+    assert main(['reset','--from-env'])==0
+    output=capsys.readouterr().out
+    assert password not in output and json.loads(output)['must_change']
+    assert main(['status'])==0
+    info=json.loads(capsys.readouterr().out)
+    assert info['matches_environment_password'] and not info['locked']

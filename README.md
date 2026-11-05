@@ -40,6 +40,24 @@ docker compose logs --tail 100 web
 
 登录账号为 `admin`，初始密码为 `.env` 中的 `ADMIN_PASSWORD`。首次登录必须更改。环境变量只在首次创建管理员时生效，后续修改环境变量不会重置密码。
 
+### 管理员无法登录时的恢复
+
+更新不会把管理员密码改回 `.env`。如果新密码和初始密码都不可用，请在服务器的项目目录运行只读检查：
+
+```bash
+docker compose exec web python scripts/admin_access.py status
+```
+
+输出只包含管理员状态、锁定剩余时间、当前环境密码是否匹配以及记录数量，不输出密码或密码哈希。若班级、用户或答卷数量明显不对，先检查是否挂载了原来的 `practice-data` 数据卷。
+
+确认是正确的数据库后，可将管理员密码恢复为**容器当前配置的 `ADMIN_PASSWORD`**：
+
+```bash
+docker compose exec web python scripts/admin_access.py reset --from-env
+```
+
+也可省略 `--from-env`，在终端交互输入新的10–128位临时密码（输入不回显）。工具会先在线备份数据库，再重设现有管理员密码、清除其登录失败锁定并使旧会话失效；班级、学生和成绩保留。登录后必须再次修改密码。它不创建新数据库、不创建账号、不提升教师或学生权限，也不提供网页恢复接口。**不要用删除数据卷或重新初始化的方式恢复登录。**
+
 内网临时访问可把 `BIND_ADDRESS` 改成 `0.0.0.0`，用 `http://服务器IP:8080` 访问。正式给学生使用时配置域名和 HTTPS，把 `COOKIE_SECURE=1` 后重建服务：
 
 ```bash
