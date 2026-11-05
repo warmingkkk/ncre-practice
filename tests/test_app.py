@@ -653,3 +653,42 @@ def test_secure_cookie_roundtrip_over_https(env):
     assert state['cookie_ok'] and state['secure']
     assert c.post('/login',base_url='https://practice.test',data=dict(csrf=state['csrf'],username='admin',password='TestPassword123')).status_code==302
     assert c.get('/admin',base_url='https://practice.test').status_code==200
+
+
+def test_reuse_deleted_class_name_and_teacher_username_keeps_history(env):
+    app,db=env;admin=client(app,1)
+    student=client(app,4);path=student.post('/tasks/1/start',data={'csrf':'token'}).location
+    student.post(path,data={'csrf':'token'})
+    assert admin.post('/classes/1/delete',data={'csrf':'token'}).status_code==302
+    data=dict(csrf='token',name='测试班',username='teacher',teacher='新班主任')
+    r=admin.post('/classes',data=data)
+    assert r.status_code==200
+    new=db.execute('SELECT * FROM classes WHERE name="测试班"').fetchone()
+    assert new['id']!=1 and new['deleted_at'] is None and new['teacher_id']!=2
+    old=db.execute('SELECT * FROM classes WHERE id=1').fetchone()
+    assert old['deleted_at'] and old['name'].startswith('测试班（已删除#1-')
+    assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0]
+    assert db.execute('SELECT id FROM users WHERE username="teacher"').fetchone()[0]==new['teacher_id']
+    assert db.execute('SELECT COUNT(*) FROM users WHERE class_id=?',(new['id'],)).fetchone()[0]==0
+    assert db.execute('SELECT COUNT(*) FROM attempts WHERE task_id=1 AND user_id=4').fetchone()[0]==1
+    assert admin.post('/classes',data=data).status_code==409
+    assert db.execute('SELECT COUNT(*) FROM users WHERE role="teacher"').fetchone()[0]==3
+    # Repeated delete and recreate remains possible.
+    assert admin.post(f'/classes/{new["id"]}/delete',data={'csrf':'token'}).status_code==302
+    assert admin.post('/classes',data=data).status_code==200
+
+
+def test_reuse_deleted_class_name_edit_and_rollback_on_account_conflict(env):
+    app,db=env;admin=client(app,1)
+    admin.post('/classes/1/delete',data={'csrf':'token'})
+    # An unrelated active account still blocks creation; archiving rolls back.
+    response=admin.post('/classes',data=dict(csrf='token',name='测试班',username='admin',teacher='教师'))
+    assert response.status_code==409
+    assert db.execute('SELECT name FROM classes WHERE id=1').fetchone()[0]=='测试班'
+    assert db.execute('SELECT username FROM users WHERE id=2').fetchone()[0]=='teacher'
+    db.execute('INSERT INTO classes(id,name,teacher_id) VALUES(2,"待改名班",3)');db.commit()
+    response=admin.post('/classes/2/edit',data=dict(csrf='token',name='测试班',username='teacher',teacher='新教师'))
+    assert response.status_code==302
+    assert db.execute('SELECT name FROM classes WHERE id=2').fetchone()[0]=='测试班'
+    assert db.execute('SELECT username FROM users WHERE id=3').fetchone()[0]=='teacher'
+    assert db.execute('SELECT deleted_at FROM users WHERE id=2').fetchone()[0]

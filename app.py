@@ -408,6 +408,20 @@ def create_app(config=None):
         qs=rows('SELECT q.*,m.wrong_count,m.mastered FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE user_id=? ORDER BY mastered,wrong_count DESC',(g.user['id'],))
         return render_template('mistakes.html',questions=qs)
 
+    def release_deleted_class_name(name):
+        # Legacy databases have a global UNIQUE constraint. Archive only the
+        # conflicting deleted row; all relationships continue to use its ID.
+        old=one('SELECT id FROM classes WHERE name=? AND deleted_at IS NOT NULL',(name,))
+        if old:
+            archived=name+'（已删除#'+str(old['id'])+'-'+secrets.token_hex(8)+'）'
+            db().execute('UPDATE classes SET name=? WHERE id=?',(archived,old['id']))
+
+    def release_deleted_teacher_username(username):
+        old=one('SELECT id FROM users WHERE username=? AND role="teacher" AND deleted_at IS NOT NULL',(username,))
+        if old:
+            archived=username+'~deleted-'+str(old['id'])+'-'+secrets.token_hex(8)
+            db().execute('UPDATE users SET username=? WHERE id=?',(archived,old['id']))
+
     @app.get('/classes/new')
     def class_new():
         if g.user['role']!='admin': abort(403)
@@ -427,12 +441,14 @@ def create_app(config=None):
         try:
             with db():
                 db().execute('BEGIN IMMEDIATE')
+                release_deleted_class_name(name)
+                release_deleted_teacher_username(username)
                 uid=db().execute('INSERT INTO users(username,name,password,role,must_change) VALUES(?,?,?,?,1)',(username,request.form.get('teacher','班主任').strip()[:80] or '班主任',generate_password_hash(password),'teacher')).lastrowid
                 cid=db().execute('INSERT INTO classes(name,teacher_id) VALUES(?,?)',(name,uid)).lastrowid
                 db().execute('DELETE FROM login_limits WHERE username=?',(username,))
                 audit('新建班级 '+name)
         except sqlite3.IntegrityError:
-            return render_template('class_new.html',form=request.form,error='班级名称或班主任账号重复，请修改后提交（已删除的记录也保留名称和账号）'),409
+            return render_template('class_new.html',form=request.form,error='班级名称或班主任账号正在被使用，请修改后提交；已删除班级名称和已删除班主任账号可复用'),409
         return render_template('credentials.html',success='班级与班主任账号创建成功',credentials=[dict(username=username,name=name+'班主任',password=password)],back=url_for('class_detail',cid=cid))
 
     @app.route('/classes/<int:cid>/edit',methods=['GET','POST'])
@@ -449,13 +465,15 @@ def create_app(config=None):
                     db().execute('BEGIN IMMEDIATE');c=classroom(cid)
                     teacher=one('SELECT * FROM users WHERE id=? AND role="teacher"',(c['teacher_id'],))
                     if not teacher: raise ValueError('班主任账号不存在')
+                    release_deleted_class_name(name)
+                    release_deleted_teacher_username(username)
                     db().execute('UPDATE classes SET name=? WHERE id=?',(name,cid))
                     db().execute('UPDATE users SET name=?,username=?,session_version=session_version+? WHERE id=?',(teacher_name,username,int(username!=teacher['username']),teacher['id']))
                     if username!=teacher['username']: db().execute('DELETE FROM login_limits WHERE username IN (?,?)',(username,teacher['username']))
                     audit('修改班级 '+str(cid))
                 flash('班级信息已保存；如修改班主任账号，请使用新账号和原密码重新登录')
                 return redirect(url_for('class_detail',cid=cid))
-            except sqlite3.IntegrityError: flash('班级名称或班主任账号已被使用，包括已删除记录')
+            except sqlite3.IntegrityError: flash('班级名称或班主任账号正在被使用；已删除班级名称和已删除班主任账号可复用')
             except ValueError as e: flash(str(e))
         return render_template('class_edit.html',classroom=c,teacher=teacher,form=request.form)
 
