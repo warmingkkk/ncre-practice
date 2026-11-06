@@ -743,3 +743,33 @@ def test_student_archive_migration_and_restore_when_number_is_free(env):
     assert teacher.post('/students/4/restore',data={'csrf':'token'}).status_code==302
     restored=db.execute('SELECT * FROM users WHERE id=4').fetchone()
     assert restored['username']=='4' and restored['deleted_at'] is None and restored['original_username'] is None
+
+
+def test_expired_tasks_offer_review_and_never_create_new_attempts(env):
+    app,db=env;c=client(app,4)
+    paths=[]
+    for tid in (1,2):
+        path=c.post(f'/tasks/{tid}/start',data={'csrf':'token'}).location
+        c.post(path,data={'csrf':'token'});paths.append(path)
+    assert '正确答案' not in c.get(paths[1]).get_data(as_text=True)
+    db.execute('UPDATE tasks SET ends="2001-01-01T00:00"');db.commit()
+    html=c.get('/').get_data(as_text=True)
+    assert '/tasks/1/review' in html and '/tasks/2/review' in html
+    assert 'action="/tasks/1/start"' not in html
+    for tid,path in zip((1,2),paths):
+        r=c.post(f'/tasks/{tid}/start',data={'csrf':'token'})
+        assert r.location==f'/tasks/{tid}/review'
+        assert path in c.get(r.location).get_data(as_text=True)
+        reviewed=c.get(path).get_data(as_text=True)
+        assert '正确答案' in reviewed and '再练一次' not in reviewed
+    assert db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]==2
+    assert '正确答案' in client(app,5).get('/tasks/2/review').get_data(as_text=True)
+    assert paths[1] not in client(app,5).get('/tasks/2/review').get_data(as_text=True)
+    assert client(app,5).get(paths[1]).status_code==403
+
+
+def test_review_does_not_leak_answers_before_end(env):
+    app,db=env;c=client(app,5)
+    for tid in (1,2):
+        assert '正确答案' not in c.get(f'/tasks/{tid}/review').get_data(as_text=True)
+    assert client(app,3).get('/tasks/2/review').status_code==403

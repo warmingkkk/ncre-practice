@@ -153,7 +153,7 @@ def create_app(config=None):
 
     @app.context_processor
     def context():
-        return dict(current=g.user, csrf=session.get('csrf',''), today=now()[:10], roles={'admin':'管理员','teacher':'班主任','student':'学生'})
+        return dict(current=g.user, csrf=session.get('csrf',''), today=now()[:10], current_time=now(), roles={'admin':'管理员','teacher':'班主任','student':'学生'})
 
     @app.errorhandler(400)
     @app.errorhandler(403)
@@ -220,8 +220,11 @@ def create_app(config=None):
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE c.deleted_at IS NULL AND teacher_id=?',(g.user['id'],))
         else:
             classes=rows('SELECT c.*,u.name teacher FROM classes c LEFT JOIN users u ON u.id=c.teacher_id WHERE c.deleted_at IS NULL AND c.id=?',(g.user['class_id'],))
-        tasks=[dict(r) for r in rows('SELECT t.*,c.name class_name,COUNT(a.submitted) attempts,COALESCE(MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END),0) active,COALESCE(MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END),0) completed FROM tasks t JOIN classes c ON c.id=t.class_id LEFT JOIN attempts a ON a.task_id=t.id AND a.user_id=? WHERE t.deleted_at IS NULL AND c.id IN (%s) GROUP BY t.id ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))]
-        for task in tasks: task['status']=task_status(task)
+        tasks=[dict(r) for r in rows('SELECT t.*,c.name class_name,COUNT(a.submitted) attempts,MAX(a.id) latest_attempt,COALESCE(MAX(CASE WHEN a.id IS NOT NULL AND a.submitted IS NULL THEN 1 ELSE 0 END),0) active,COALESCE(MAX(CASE WHEN a.submitted IS NOT NULL THEN a.passed ELSE 0 END),0) completed FROM tasks t JOIN classes c ON c.id=t.class_id LEFT JOIN attempts a ON a.task_id=t.id AND a.user_id=? WHERE t.deleted_at IS NULL AND c.id IN (%s) GROUP BY t.id ORDER BY t.id DESC LIMIT 50' % (','.join('?' for _ in classes) or 'NULL'),(g.user['id'],*[c['id'] for c in classes]))]
+        for task in tasks:
+            task['status']=task_status(task)
+            task['closed']=now()>=task['ends']
+            task['opened']=task['starts']<=now()<task['ends']
         stats=one('SELECT COUNT(*) attempts,COALESCE(SUM(score),0) correct,COALESCE(SUM(total),0) total FROM attempts WHERE user_id=? AND submitted IS NOT NULL',(g.user['id'],))
         wrong=one('SELECT COUNT(*) n FROM mistakes m JOIN questions q ON q.id=m.question_id WHERE m.user_id=? AND m.mastered=0 AND q.deleted_at IS NULL',(g.user['id'],))['n']
         return render_template('home.html',classes=classes,tasks=tasks,stats=stats,wrong=wrong,bank_count=one('SELECT COUNT(*) n FROM questions WHERE deleted_at IS NULL')['n'])
@@ -334,11 +337,23 @@ def create_app(config=None):
         t=task_access(tid)
         if g.user['role']!='student': abort(403)
         if t['deleted_at']: abort(400,'该任务已删除，不能开始新的作答')
-        if now()<t['starts'] or now()>=t['ends']: abort(400,'当前不在开放时间内')
+        if now()>=t['ends']: return redirect(url_for('task_review',tid=tid))
+        if now()<t['starts']: abort(400,'该任务尚未开始')
         old=one('SELECT * FROM attempts WHERE task_id=? AND user_id=? ORDER BY id DESC LIMIT 1',(tid,g.user['id']))
         if old and (old['submitted'] is None or t['kind']=='exam'):
             return redirect(url_for('attempt',aid=old['id']))
         return redirect(url_for('attempt',aid=new_attempt(json.loads(t['question_ids']),t)))
+
+    @app.get('/tasks/<int:tid>/review')
+    def task_review(tid):
+        t=task_access(tid)
+        if g.user['role']!='student': abort(403)
+        attempts=rows('SELECT * FROM attempts WHERE task_id=? AND user_id=? ORDER BY id DESC',(tid,g.user['id']))
+        questions=[]
+        if now()>=t['ends'] and not attempts:
+            questions=[dict(one('SELECT * FROM questions WHERE id=?',(qid,))) for qid in json.loads(t['question_ids'])]
+            for q in questions: q['options']=json.loads(q['options'])
+        return render_template('task_review.html',task=t,attempts=attempts,questions=questions,closed=now()>=t['ends'])
 
     def get_attempt(aid):
         a=one('SELECT * FROM attempts WHERE id=?',(aid,))
